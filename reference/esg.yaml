@@ -65,12 +65,12 @@ rls_group_column: ad_group
 #               set   -> resolved (and provisioned) from Entra ID via AIM (`resolve-group-proxy`)
 #               null  -> created as a local Databricks account group (no Entra link)
 groups:
-  - { name: hera-all-esg-read-unmasked,    external_id: null }
-  - { name: hera-all-esg-read-masked,      external_id: null }
-  - { name: hera-sg-esg-read-masked,       external_id: null }
-  - { name: hera-sg-eq-read-masked,        external_id: null }
-  - { name: hera-sg-fi-read-masked,        external_id: null }
-  - { name: hera-all-admin-admin-unmasked, external_id: null }
+  - { name: GSGEIS-hera-all-esg-read-unmasked, external_id: c7855984-0e29-4463-af86-d2103d1299d1 }
+  - { name: GSGEIS-hera-all-esg-read-masked,   external_id: 1f3f024b-61dc-4625-9921-cf3e164f681f }
+  - { name: GSGEIS-hera-sg-esg-read-masked,    external_id: c2ae0a3d-ae85-431d-ad59-d1b3e245ad10 }
+  - { name: GSGEIS-hera-sg-eq-read-masked,     external_id: 27888b59-c6a9-4cdb-a67f-7391ff654a67 }
+  - { name: GSGEIS-hera-sg-fi-read-masked,     external_id: 7af49fb7-690c-4861-be9e-fbd0579d9006 }
+  - { name: GSGEIS-hera-all-admin-admin-unmasked, external_id: null }
 
 # ---- schemas by role (all created by Terraform; the union is the approved-schema set) ----------
 # governance_schemas: helper schema(s) — mask UDFs, the group_portfolio_access MV, entitlement tables.

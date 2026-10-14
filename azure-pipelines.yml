@@ -10,7 +10,7 @@ variables:
   - group: DEV-HERA-REPLATFORM        # adb (workspace URL), accessToken (secret)
   - name: cliVersion
     value: 1.19.0
-  - name: configRoot                  # each deploy goes to <configRoot>/<env>/<build number>-<short sha>
+  - name: configRoot                  # each deploy goes to <configRoot>/<env>/<yyyyMMdd>-<build id>-<short sha>
     value: /Workspace/Users/xieming.li@eastspring.com/configs
   - name: wheelPipelineId             # the build pipeline that publishes artifact "wheels"
     value: 8050
@@ -118,9 +118,13 @@ steps:
     function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
     function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
 
-    # versioned target: <configRoot>/<env>/<build number>-<short sha>, e.g. .../configs/esg/20261015.3-a1b2c3d
+    # versioned target: <configRoot>/<env>/<yyyyMMdd>-<build id>-<short sha>
+    #   e.g. .../configs/esg/20261015-48213-a1b2c3d
+    # The name starts with the deploy date (UTC), so old deploys can be found and removed by name,
+    # and folders sort oldest -> newest.
+    $date   = (Get-Date).ToUniversalTime().ToString("yyyyMMdd")
     $sha    = "$(Build.SourceVersion)".Substring(0, 7)
-    $target = "$(configRoot)/$(env)/$(Build.BuildNumber)-$sha"
+    $target = "$(configRoot)/$(env)/$date-$(Build.BuildId)-$sha"
     Log "Deploy config"
     Write-Host "workspace      : $env:DATABRICKS_HOST"
     Write-Host "commit         : $(Build.SourceVersion)"

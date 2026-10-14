@@ -119,7 +119,8 @@ steps:
     function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
 
     # versioned target: <configRoot>/<env>/<yyyyMMdd>-<build id>-<short sha>
-    #   e.g. .../configs/esg/20261015-48213-a1b2c3d
+    #   e.g. .../configs/esg/20261015-48213-a1b2c3d/configs/*.yaml
+    #                                              /reference/esg.yaml
     # The name starts with the deploy date (UTC), so old deploys can be found and removed by name,
     # and folders sort oldest -> newest.
     $date   = (Get-Date).ToUniversalTime().ToString("yyyyMMdd")
@@ -130,9 +131,9 @@ steps:
     Write-Host "commit         : $(Build.SourceVersion)"
     Write-Host "target         : $target"
 
-    databricks workspace mkdirs "$target/configs/$(env)"
+    databricks workspace mkdirs "$target/configs"
     if ($LASTEXITCODE -ne 0) { Fail "could not create $target (exit $LASTEXITCODE)" }
-    databricks workspace import-dir "configs\$(env)" "$target/configs/$(env)" --overwrite
+    databricks workspace import-dir "configs\$(env)" "$target/configs" --overwrite
     if ($LASTEXITCODE -ne 0) { Fail "config upload failed (exit $LASTEXITCODE)" }
 
     databricks workspace mkdirs "$target/reference"
@@ -140,14 +141,14 @@ steps:
     if ($LASTEXITCODE -ne 0) { Fail "reference upload failed (exit $LASTEXITCODE)" }
 
     Write-Host "##[group]deployed files"
-    databricks workspace list "$target/configs/$(env)"
+    databricks workspace list "$target/configs"
     databricks workspace list "$target/reference"
     Write-Host "##[endgroup]"
 
     # for later steps (e.g. a reconcile plan): the paths the notebook's widgets need
-    Write-Host "##vso[task.setvariable variable=configPath]$target/configs/$(env)"
+    Write-Host "##vso[task.setvariable variable=configPath]$target/configs"
     Write-Host "##vso[task.setvariable variable=referencePath]$target/reference/$(env).yaml"
-    Write-Host "config_path    : $target/configs/$(env)"
+    Write-Host "config_path    : $target/configs"
     Write-Host "reference_path : $target/reference/$(env).yaml"
     Log "Config deployed"
   displayName: '6. Deploy Config to Workspace'

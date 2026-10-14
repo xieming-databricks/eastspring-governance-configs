@@ -1,11 +1,17 @@
 # eastspring-governance-configs — onboarding pipeline.
-# Downloads the eastspring-uc-governance wheel built by pipeline 8050, then checks that the
-# committed configs/esg matches the workbook and validates it against reference/esg.yaml.
+# Downloads the eastspring-uc-governance wheel built by pipeline 8050, checks that the committed
+# configs/esg matches the workbook, validates it against reference/esg.yaml, and — only if that
+# all passed — deploys both to a new, versioned folder in the Databricks workspace.
 
 trigger:
   - main
 
 variables:
+  - group: DEV-HERA-REPLATFORM        # adb (workspace URL), accessToken (secret)
+  - name: cliVersion
+    value: 1.19.0
+  - name: configRoot                  # each deploy goes to <configRoot>/<env>/<build number>-<short sha>
+    value: /Workspace/Users/xieming.li@eastspring.com/configs
   - name: wheelPipelineId             # the build pipeline that publishes artifact "wheels"
     value: 8050
   - name: wheelProject
@@ -86,3 +92,62 @@ steps:
     if ($LASTEXITCODE -ne 0) { Fail "validation failed (exit $LASTEXITCODE) — see the issues above" }
     Log "Config valid"
   displayName: '4. Validate Config'
+
+- powershell: |
+    function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
+    function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
+
+    $dir = "$(Agent.ToolsDirectory)\databricks-cli\$(cliVersion)"
+    Log "Databricks CLI $(cliVersion) -> $dir"
+    if (Test-Path "$dir\databricks.exe") {
+      Write-Host "already cached on this agent — skipping download"
+    } else {
+      $url = "https://github.com/databricks/cli/releases/download/v$(cliVersion)/databricks_cli_$(cliVersion)_windows_amd64.zip"
+      $zip = "$(Agent.TempDirectory)\databricks.zip"
+      Write-Host "downloading    : $url"
+      Invoke-WebRequest -Uri $url -OutFile $zip
+      Expand-Archive $zip -DestinationPath $dir -Force
+    }
+    if (-not (Test-Path "$dir\databricks.exe")) { Fail "databricks.exe not found in $dir" }
+    Write-Host "##vso[task.prependpath]$dir"
+    Write-Host "version        : $(& "$dir\databricks.exe" version)"
+  displayName: '5. Install Databricks CLI $(cliVersion)'
+  condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+
+- powershell: |
+    function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
+    function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
+
+    # versioned target: <configRoot>/<env>/<build number>-<short sha>, e.g. .../configs/esg/20261015.3-a1b2c3d
+    $sha    = "$(Build.SourceVersion)".Substring(0, 7)
+    $target = "$(configRoot)/$(env)/$(Build.BuildNumber)-$sha"
+    Log "Deploy config"
+    Write-Host "workspace      : $env:DATABRICKS_HOST"
+    Write-Host "commit         : $(Build.SourceVersion)"
+    Write-Host "target         : $target"
+
+    databricks workspace mkdirs "$target/configs/$(env)"
+    if ($LASTEXITCODE -ne 0) { Fail "could not create $target (exit $LASTEXITCODE)" }
+    databricks workspace import-dir "configs\$(env)" "$target/configs/$(env)" --overwrite
+    if ($LASTEXITCODE -ne 0) { Fail "config upload failed (exit $LASTEXITCODE)" }
+
+    databricks workspace mkdirs "$target/reference"
+    databricks workspace import "$target/reference/$(env).yaml" --file "reference\$(env).yaml" --format AUTO --overwrite
+    if ($LASTEXITCODE -ne 0) { Fail "reference upload failed (exit $LASTEXITCODE)" }
+
+    Write-Host "##[group]deployed files"
+    databricks workspace list "$target/configs/$(env)"
+    databricks workspace list "$target/reference"
+    Write-Host "##[endgroup]"
+
+    # for later steps (e.g. a reconcile plan): the paths the notebook's widgets need
+    Write-Host "##vso[task.setvariable variable=configPath]$target/configs/$(env)"
+    Write-Host "##vso[task.setvariable variable=referencePath]$target/reference/$(env).yaml"
+    Write-Host "config_path    : $target/configs/$(env)"
+    Write-Host "reference_path : $target/reference/$(env).yaml"
+    Log "Config deployed"
+  displayName: '6. Deploy Config to Workspace'
+  condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+  env:
+    DATABRICKS_HOST: $(adb)
+    DATABRICKS_TOKEN: $(accessToken)

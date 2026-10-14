@@ -1,0 +1,88 @@
+# eastspring-governance-configs — onboarding pipeline.
+# Downloads the eastspring-uc-governance wheel built by pipeline 8050, then checks that the
+# committed configs/esg matches the workbook and validates it against reference/esg.yaml.
+
+trigger:
+  - main
+
+variables:
+  - name: wheelPipelineId             # the build pipeline that publishes artifact "wheels"
+    value: 8050
+  - name: wheelProject
+    value: eisgheradp
+  - name: env
+    value: esg
+  - name: workbook
+    value: excels\esg\access-matrix-esg_workshop-v3-dynamic-views.xlsx
+
+pool:
+  name: sgesss-nprd-dev
+
+steps:
+- task: DownloadPipelineArtifact@2
+  displayName: '1. Download Wheel (pipeline $(wheelPipelineId), latest main)'
+  inputs:
+    source: specific
+    project: $(wheelProject)
+    pipeline: $(wheelPipelineId)
+    runVersion: latestFromBranch       # newest successful run of...
+    runBranch: refs/heads/main         # ...this branch
+    artifact: wheels
+    path: $(Pipeline.Workspace)\wheels
+
+- powershell: |
+    function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
+    function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
+
+    $whl = Get-ChildItem "$(Pipeline.Workspace)\wheels\*.whl" | Select-Object -First 1
+    if (-not $whl) { Fail "no .whl in $(Pipeline.Workspace)\wheels" }
+    Log "Downloaded wheel"
+    Write-Host "wheel          : $($whl.Name) ($([math]::Round($whl.Length / 1KB)) KB)"
+
+    Log "Fresh venv + install wheel"
+    Remove-Item -Recurse -Force ucgov_venv -ErrorAction SilentlyContinue
+    python -m venv ucgov_venv
+    .\ucgov_venv\Scripts\Activate.ps1
+    Write-Host "python         : $(python --version)"
+    Write-Host "##[group]pip install output"
+    python -m pip install $whl.FullName
+    $rc = $LASTEXITCODE
+    Write-Host "##[endgroup]"
+    if ($rc -ne 0) { Fail "pip install failed (exit $rc)" }
+    Write-Host "installed      : $((python -m pip show eastspring-uc-governance | Select-String '^Version').ToString())"
+    # later steps run in new processes: put the venv's scripts (ucgov-*) on their PATH
+    Write-Host "##vso[task.prependpath]$(System.DefaultWorkingDirectory)\ucgov_venv\Scripts"
+  displayName: '2. Install Wheel'
+
+- powershell: |
+    function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
+    function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
+
+    Log "Regenerate configs\$(env) from $(workbook)"
+    ucgov-generate "$(workbook)" "configs\$(env)"
+    if ($LASTEXITCODE -ne 0) { Fail "ucgov-generate failed (exit $LASTEXITCODE)" }
+
+    Log "Compare with the committed configs\$(env)"
+    # --ignore-cr-at-eol: files written on Windows have CRLF; only real content changes count
+    $changed   = git diff --name-only --ignore-cr-at-eol -- "configs/$(env)"
+    $untracked = git ls-files --others --exclude-standard -- "configs/$(env)"
+    if ($changed -or $untracked) {
+      Write-Host "##[group]out-of-date files"
+      $changed   | ForEach-Object { Write-Host "changed  : $_" }
+      $untracked | ForEach-Object { Write-Host "not committed: $_" }
+      git --no-pager diff --ignore-cr-at-eol -- "configs/$(env)"
+      Write-Host "##[endgroup]"
+      Fail "configs\$(env) is out of date with the workbook — run ucgov-generate locally and commit the result"
+    }
+    Write-Host "configs\$(env) matches the workbook"
+  displayName: '3. Check Config Is Up To Date'
+
+- powershell: |
+    function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
+    function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
+
+    Log "Validate configs\$(env) against reference\$(env).yaml"
+    ucgov-validate "configs\$(env)" --reference "reference\$(env).yaml" --verbose
+    if ($LASTEXITCODE -ne 0) { Fail "validation failed (exit $LASTEXITCODE) — see the issues above" }
+    Log "Config valid"
+  displayName: '4. Validate Config'

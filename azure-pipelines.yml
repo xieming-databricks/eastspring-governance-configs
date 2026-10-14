@@ -1,16 +1,25 @@
 # eastspring-governance-configs — onboarding pipeline.
 # Downloads the eastspring-uc-governance wheel built by pipeline 8050, checks that the committed
-# configs/esg matches the workbook, validates it against reference/esg.yaml, and — only if that
-# all passed — deploys both to a new, versioned folder in the Databricks workspace.
+# config/esg matches the workbook, validates it against reference/esg.yaml, and — only if that
+# all passed — deploys both to a new, versioned folder in the Databricks workspace and runs a
+# reconcile PLAN (dry run, changes nothing) against it. Runs for pushes to main and for pull
+# requests (build validation), so the delta can be reviewed before merging.
+# Step 7 has two branches: 7a runs for pull requests, 7b for merges to main. Both are a
+# PLAN for now (no apply); 7b is the one to switch to apply later.
 
-trigger:
+trigger:                              # pushes (merges) to main
   - main
+
+pr:                                   # pull requests INTO main only (GitHub repo: YAML pr triggers apply)
+  branches:
+    include:
+      - main
 
 variables:
   - group: DEV-HERA-REPLATFORM        # adb (workspace URL), accessToken (secret)
   - name: cliVersion
     value: 1.19.0
-  - name: configRoot                  # each deploy goes to <configRoot>/<env>/<yyyyMMdd>-<build id>-<short sha>
+  - name: configRoot                  # each deploy goes to <configRoot>/<env>/<yyyyMMdd>-[pr<id>-]<build id>-<short sha>
     value: /Workspace/Users/xieming.li@eastspring.com/configs
   - name: wheelPipelineId             # the build pipeline that publishes artifact "wheels"
     value: 8050
@@ -20,139 +29,166 @@ variables:
     value: esg
   - name: workbook
     value: excels\esg\access-matrix-esg_workshop-v3-dynamic-views.xlsx
+  - name: reconcileJob                # created / updated by the wheel pipeline (jobs/ucgov_reconcile.json)
+    value: ucgov-reconcile
 
 pool:
   name: sgesss-nprd-dev
 
-steps:
-- task: DownloadPipelineArtifact@2
-  displayName: '1. Download Wheel (pipeline $(wheelPipelineId), latest main)'
-  inputs:
-    source: specific
-    project: $(wheelProject)
-    pipeline: $(wheelPipelineId)
-    runVersion: latestFromBranch       # newest successful run of...
-    runBranch: refs/heads/main         # ...this branch
-    artifact: wheels
-    path: $(Pipeline.Workspace)\wheels
+# Safety net on top of `pr:` above: a PR build into any branch other than main is skipped.
+# (System.PullRequest.TargetBranch is "main" for GitHub, "refs/heads/main" for Azure Repos.)
+jobs:
+- job: config_update
+  displayName: 'Validate, Deploy Config, Reconcile Plan'
+  condition: or(ne(variables['Build.Reason'], 'PullRequest'), in(variables['System.PullRequest.TargetBranch'], 'main', 'refs/heads/main'))
+  steps:
+  - task: DownloadPipelineArtifact@2
+    displayName: '1. Download Wheel (pipeline $(wheelPipelineId), latest main)'
+    inputs:
+      source: specific
+      project: $(wheelProject)
+      pipeline: $(wheelPipelineId)
+      runVersion: latestFromBranch       # newest successful run of...
+      runBranch: refs/heads/main         # ...this branch
+      artifact: wheels
+      path: $(Pipeline.Workspace)\wheels
 
-- powershell: |
-    function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
-    function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
+  - powershell: |
+      function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
+      function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
 
-    $whl = Get-ChildItem "$(Pipeline.Workspace)\wheels\*.whl" | Select-Object -First 1
-    if (-not $whl) { Fail "no .whl in $(Pipeline.Workspace)\wheels" }
-    Log "Downloaded wheel"
-    Write-Host "wheel          : $($whl.Name) ($([math]::Round($whl.Length / 1KB)) KB)"
+      $whl = Get-ChildItem "$(Pipeline.Workspace)\wheels\*.whl" | Select-Object -First 1
+      if (-not $whl) { Fail "no .whl in $(Pipeline.Workspace)\wheels" }
+      Log "Downloaded wheel"
+      Write-Host "wheel          : $($whl.Name) ($([math]::Round($whl.Length / 1KB)) KB)"
 
-    Log "Fresh venv + install wheel"
-    Remove-Item -Recurse -Force ucgov_venv -ErrorAction SilentlyContinue
-    python -m venv ucgov_venv
-    .\ucgov_venv\Scripts\Activate.ps1
-    Write-Host "python         : $(python --version)"
-    Write-Host "##[group]pip install output"
-    python -m pip install $whl.FullName
-    $rc = $LASTEXITCODE
-    Write-Host "##[endgroup]"
-    if ($rc -ne 0) { Fail "pip install failed (exit $rc)" }
-    Write-Host "installed      : $((python -m pip show eastspring-uc-governance | Select-String '^Version').ToString())"
-    # later steps run in new processes: put the venv's scripts (ucgov-*) on their PATH
-    Write-Host "##vso[task.prependpath]$(System.DefaultWorkingDirectory)\ucgov_venv\Scripts"
-  displayName: '2. Install Wheel'
-
-- powershell: |
-    function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
-    function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
-
-    Log "Regenerate configs\$(env) from $(workbook)"
-    ucgov-generate "$(workbook)" "configs\$(env)"
-    if ($LASTEXITCODE -ne 0) { Fail "ucgov-generate failed (exit $LASTEXITCODE)" }
-
-    Log "Compare with the committed configs\$(env)"
-    # --ignore-cr-at-eol: files written on Windows have CRLF; only real content changes count
-    $changed   = git diff --name-only --ignore-cr-at-eol -- "configs/$(env)"
-    $untracked = git ls-files --others --exclude-standard -- "configs/$(env)"
-    if ($changed -or $untracked) {
-      Write-Host "##[group]out-of-date files"
-      $changed   | ForEach-Object { Write-Host "changed  : $_" }
-      $untracked | ForEach-Object { Write-Host "not committed: $_" }
-      git --no-pager diff --ignore-cr-at-eol -- "configs/$(env)"
+      Log "Fresh venv + install wheel"
+      Remove-Item -Recurse -Force ucgov_venv -ErrorAction SilentlyContinue
+      python -m venv ucgov_venv
+      .\ucgov_venv\Scripts\Activate.ps1
+      Write-Host "python         : $(python --version)"
+      Write-Host "##[group]pip install output"
+      python -m pip install $whl.FullName
+      $rc = $LASTEXITCODE
       Write-Host "##[endgroup]"
-      Fail "configs\$(env) is out of date with the workbook — run ucgov-generate locally and commit the result"
-    }
-    Write-Host "configs\$(env) matches the workbook"
-  displayName: '3. Check Config Is Up To Date'
+      if ($rc -ne 0) { Fail "pip install failed (exit $rc)" }
+      Write-Host "installed      : $((python -m pip show eastspring-uc-governance | Select-String '^Version').ToString())"
+      # later steps run in new processes: put the venv's scripts (ucgov-*) on their PATH
+      Write-Host "##vso[task.prependpath]$(System.DefaultWorkingDirectory)\ucgov_venv\Scripts"
+    displayName: '2. Install Wheel'
 
-- powershell: |
-    function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
-    function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
+  - powershell: |
+      function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
+      function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
 
-    Log "Validate configs\$(env) against reference\$(env).yaml"
-    ucgov-validate "configs\$(env)" --reference "reference\$(env).yaml" --verbose
-    if ($LASTEXITCODE -ne 0) { Fail "validation failed (exit $LASTEXITCODE) — see the issues above" }
-    Log "Config valid"
-  displayName: '4. Validate Config'
+      Log "Regenerate config\$(env) from $(workbook)"
+      ucgov-generate "$(workbook)" "config\$(env)"
+      if ($LASTEXITCODE -ne 0) { Fail "ucgov-generate failed (exit $LASTEXITCODE)" }
 
-- powershell: |
-    function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
-    function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
+      Log "Compare with the committed config\$(env)"
+      # --ignore-cr-at-eol: files written on Windows have CRLF; only real content changes count
+      $changed   = git diff --name-only --ignore-cr-at-eol -- "config/$(env)"
+      $untracked = git ls-files --others --exclude-standard -- "config/$(env)"
+      if ($changed -or $untracked) {
+        Write-Host "##[group]out-of-date files"
+        $changed   | ForEach-Object { Write-Host "changed  : $_" }
+        $untracked | ForEach-Object { Write-Host "not committed: $_" }
+        git --no-pager diff --ignore-cr-at-eol -- "config/$(env)"
+        Write-Host "##[endgroup]"
+        Fail "config\$(env) is out of date with the workbook — run ucgov-generate locally and commit the result"
+      }
+      Write-Host "config\$(env) matches the workbook"
+    displayName: '3. Check Config Is Up To Date'
 
-    $dir = "$(Agent.ToolsDirectory)\databricks-cli\$(cliVersion)"
-    Log "Databricks CLI $(cliVersion) -> $dir"
-    if (Test-Path "$dir\databricks.exe") {
-      Write-Host "already cached on this agent — skipping download"
-    } else {
-      $url = "https://github.com/databricks/cli/releases/download/v$(cliVersion)/databricks_cli_$(cliVersion)_windows_amd64.zip"
-      $zip = "$(Agent.TempDirectory)\databricks.zip"
-      Write-Host "downloading    : $url"
-      Invoke-WebRequest -Uri $url -OutFile $zip
-      Expand-Archive $zip -DestinationPath $dir -Force
-    }
-    if (-not (Test-Path "$dir\databricks.exe")) { Fail "databricks.exe not found in $dir" }
-    Write-Host "##vso[task.prependpath]$dir"
-    Write-Host "version        : $(& "$dir\databricks.exe" version)"
-  displayName: '5. Install Databricks CLI $(cliVersion)'
-  condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+  - powershell: |
+      function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
+      function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
 
-- powershell: |
-    function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
-    function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
+      Log "Validate config\$(env) against reference\$(env).yaml"
+      ucgov-validate "config\$(env)" --reference "reference\$(env).yaml" --verbose
+      if ($LASTEXITCODE -ne 0) { Fail "validation failed (exit $LASTEXITCODE) — see the issues above" }
+      Log "Config valid"
+    displayName: '4. Validate Config'
 
-    # versioned target: <configRoot>/<env>/<yyyyMMdd>-<build id>-<short sha>
-    #   e.g. .../configs/esg/20261015-48213-a1b2c3d/configs/*.yaml
-    #                                              /reference/esg.yaml
-    # The name starts with the deploy date (UTC), so old deploys can be found and removed by name,
-    # and folders sort oldest -> newest.
-    $date   = (Get-Date).ToUniversalTime().ToString("yyyyMMdd")
-    $sha    = "$(Build.SourceVersion)".Substring(0, 7)
-    $target = "$(configRoot)/$(env)/$date-$(Build.BuildId)-$sha"
-    Log "Deploy config"
-    Write-Host "workspace      : $env:DATABRICKS_HOST"
-    Write-Host "commit         : $(Build.SourceVersion)"
-    Write-Host "target         : $target"
+  - powershell: |
+      function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
+      function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
 
-    databricks workspace mkdirs "$target/configs"
-    if ($LASTEXITCODE -ne 0) { Fail "could not create $target (exit $LASTEXITCODE)" }
-    databricks workspace import-dir "configs\$(env)" "$target/configs" --overwrite
-    if ($LASTEXITCODE -ne 0) { Fail "config upload failed (exit $LASTEXITCODE)" }
+      $dir = "$(Agent.ToolsDirectory)\databricks-cli\$(cliVersion)"
+      Log "Databricks CLI $(cliVersion) -> $dir"
+      if (Test-Path "$dir\databricks.exe") {
+        Write-Host "already cached on this agent — skipping download"
+      } else {
+        $url = "https://github.com/databricks/cli/releases/download/v$(cliVersion)/databricks_cli_$(cliVersion)_windows_amd64.zip"
+        $zip = "$(Agent.TempDirectory)\databricks.zip"
+        Write-Host "downloading    : $url"
+        Invoke-WebRequest -Uri $url -OutFile $zip
+        Expand-Archive $zip -DestinationPath $dir -Force
+      }
+      if (-not (Test-Path "$dir\databricks.exe")) { Fail "databricks.exe not found in $dir" }
+      Write-Host "##vso[task.prependpath]$dir"
+      Write-Host "version        : $(& "$dir\databricks.exe" version)"
+    displayName: '5. Install Databricks CLI $(cliVersion)'
 
-    databricks workspace mkdirs "$target/reference"
-    databricks workspace import "$target/reference/$(env).yaml" --file "reference\$(env).yaml" --format AUTO --overwrite
-    if ($LASTEXITCODE -ne 0) { Fail "reference upload failed (exit $LASTEXITCODE)" }
+  - powershell: |
+      function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
+      function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
 
-    Write-Host "##[group]deployed files"
-    databricks workspace list "$target/configs"
-    databricks workspace list "$target/reference"
-    Write-Host "##[endgroup]"
+      # versioned target: <configRoot>/<env>/<yyyyMMdd>-[pr<id>-]<build id>-<short sha>
+      #   main: .../configs/esg/20261015-48213-a1b2c3d/config/esg/*.yaml
+      #                                                /reference/esg.yaml
+      #   PR  : .../configs/esg/20261015-pr12-48214-e4f5a6b/...
+      # (inside a deploy folder the layout mirrors the repo: config/<env>/ + reference/<env>.yaml)
+      # The name starts with the deploy date (UTC), so old deploys can be found and removed by name,
+      # and folders sort oldest -> newest. PR deploys carry "pr<id>" so they can be told apart.
+      $isPr   = $env:BUILD_REASON -eq "PullRequest"
+      # PR builds check out a merge commit; the PR's own head commit is the one worth recording
+      $commit = if ($isPr -and $env:SYSTEM_PULLREQUEST_SOURCECOMMITID) { $env:SYSTEM_PULLREQUEST_SOURCECOMMITID } else { "$(Build.SourceVersion)" }
+      $date   = (Get-Date).ToUniversalTime().ToString("yyyyMMdd")
+      # PR number: GitHub sets PULLREQUESTNUMBER (its PULLREQUESTID is internal); Azure Repos only the id
+      $prNum  = if ($env:SYSTEM_PULLREQUEST_PULLREQUESTNUMBER) { $env:SYSTEM_PULLREQUEST_PULLREQUESTNUMBER } else { $env:SYSTEM_PULLREQUEST_PULLREQUESTID }
+      $pr     = if ($isPr) { "pr$prNum-" } else { "" }
+      $target = "$(configRoot)/$(env)/$date-$pr$(Build.BuildId)-$($commit.Substring(0, 7))"
+      Log "Deploy config"
+      Write-Host "workspace      : $env:DATABRICKS_HOST"
+      Write-Host "build reason   : $env:BUILD_REASON$(if ($isPr) { " (PR $prNum)" })"
+      Write-Host "commit         : $commit"
+      Write-Host "target         : $target"
 
-    # for later steps (e.g. a reconcile plan): the paths the notebook's widgets need
-    Write-Host "##vso[task.setvariable variable=configPath]$target/configs"
-    Write-Host "##vso[task.setvariable variable=referencePath]$target/reference/$(env).yaml"
-    Write-Host "config_path    : $target/configs"
-    Write-Host "reference_path : $target/reference/$(env).yaml"
-    Log "Config deployed"
-  displayName: '6. Deploy Config to Workspace'
-  condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
-  env:
-    DATABRICKS_HOST: $(adb)
-    DATABRICKS_TOKEN: $(accessToken)
+      databricks workspace mkdirs "$target/config/$(env)"
+      if ($LASTEXITCODE -ne 0) { Fail "could not create $target (exit $LASTEXITCODE)" }
+      databricks workspace import-dir "config\$(env)" "$target/config/$(env)" --overwrite
+      if ($LASTEXITCODE -ne 0) { Fail "config upload failed (exit $LASTEXITCODE)" }
+
+      databricks workspace mkdirs "$target/reference"
+      databricks workspace import "$target/reference/$(env).yaml" --file "reference\$(env).yaml" --format AUTO --overwrite
+      if ($LASTEXITCODE -ne 0) { Fail "reference upload failed (exit $LASTEXITCODE)" }
+
+      Write-Host "##[group]deployed files"
+      databricks workspace list "$target/config/$(env)"
+      databricks workspace list "$target/reference"
+      Write-Host "##[endgroup]"
+
+      # for later steps (e.g. a reconcile plan): the paths the notebook's widgets need
+      Write-Host "##vso[task.setvariable variable=configPath]$target/config/$(env)"
+      Write-Host "##vso[task.setvariable variable=referencePath]$target/reference/$(env).yaml"
+      Write-Host "config_path    : $target/config/$(env)"
+      Write-Host "reference_path : $target/reference/$(env).yaml"
+      Log "Config deployed"
+    displayName: '6. Deploy Config to Workspace'
+    env:
+      DATABRICKS_HOST: $(adb)
+      DATABRICKS_TOKEN: $(accessToken)
+
+  # 7. Reconcile — same job, two triggers. Both are a PLAN for now.
+  - template: templates/reconcile-run.yml
+    parameters:
+      displayName: '7a. Reconcile Plan (pull request)'
+      condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), in(variables['System.PullRequest.TargetBranch'], 'main', 'refs/heads/main'))
+      mode: plan
+
+  - template: templates/reconcile-run.yml
+    parameters:
+      displayName: '7b. Reconcile Plan (merge to main)'
+      condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+      mode: plan                        # change to apply later

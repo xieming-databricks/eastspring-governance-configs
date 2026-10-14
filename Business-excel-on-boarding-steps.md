@@ -27,22 +27,22 @@ pip install &lt;path-to&gt;\dist\eastspring_uc_governance-0.2.0-py3-none-any.whl
 
 <tr><td><b>Generate yaml from excel</b></td>
 <td><pre>
-ucgov-generate excels/esg/access-matrix-esg_workshop-v3-dynamic-views.xlsx configs/esg --check
+ucgov-generate excels/esg/access-matrix-esg_workshop-v3-dynamic-views.xlsx config/esg --check
 
-ucgov-generate excels/esg/access-matrix-esg_workshop-v3-dynamic-views.xlsx configs/esg
+ucgov-generate excels/esg/access-matrix-esg_workshop-v3-dynamic-views.xlsx config/esg
 </pre></td>
 <td><pre>
-ucgov-generate excels\esg\access-matrix-esg_workshop-v3-dynamic-views.xlsx configs\esg --check
+ucgov-generate excels\esg\access-matrix-esg_workshop-v3-dynamic-views.xlsx config\esg --check
 
-ucgov-generate excels\esg\access-matrix-esg_workshop-v3-dynamic-views.xlsx configs\esg
+ucgov-generate excels\esg\access-matrix-esg_workshop-v3-dynamic-views.xlsx config\esg
 </pre></td></tr>
 
 <tr><td><b>Validate</b></td>
 <td><pre>
-ucgov-validate --reference reference/esg.yaml configs/esg --verbose
+ucgov-validate --reference reference/esg.yaml config/esg --verbose
 </pre></td>
 <td><pre>
-ucgov-validate --reference reference\esg.yaml configs\esg --verbose
+ucgov-validate --reference reference\esg.yaml config\esg --verbose
 </pre></td></tr>
 </table>
 

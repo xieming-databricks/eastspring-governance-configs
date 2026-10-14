@@ -1,0 +1,88 @@
+# Run the ucgov-reconcile Databricks job against the config deployed by step 6, wait for it, and
+# publish the notebook's full output (every cell, print and table) as an HTML artifact
+# "reconcile-<mode>". Used twice by azure-pipelines.yml (pull request + merge to main).
+parameters:
+  - name: displayName
+    type: string
+  - name: condition
+    type: string
+  - name: mode                        # plan = dry run (changes nothing) | apply
+    type: string
+    values: [plan, apply]
+
+steps:
+- powershell: |
+    function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
+    function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
+
+    Log "Find job $(reconcileJob)"
+    $raw = databricks jobs list --name "$(reconcileJob)" -o json | Out-String
+    if ($LASTEXITCODE -ne 0) { Fail "could not list jobs (exit $LASTEXITCODE)" }
+    $found = @()
+    if (-not [string]::IsNullOrWhiteSpace($raw)) {
+      $found = @(@($raw | ConvertFrom-Json) | ForEach-Object { $_ } | Where-Object { $_.job_id })
+    }
+    if ($found.Count -ne 1) { Fail "expected 1 job named '$(reconcileJob)', found $($found.Count) — run the wheel pipeline to create it" }
+    $jobId = $found[0].job_id
+    Write-Host "job            : $(reconcileJob) (id $jobId)"
+
+    Log "Start reconcile $("${{ parameters.mode }}".ToUpper())"
+    Write-Host "config_path    : $(configPath)"
+    Write-Host "reference_path : $(referencePath)"
+    Write-Host "mode           : ${{ parameters.mode }}$(if ('${{ parameters.mode }}' -eq 'plan') { '   (dry run — changes nothing)' })"
+    @"
+    {"job_id": $jobId,
+     "job_parameters": {"config_path": "$(configPath)", "reference_path": "$(referencePath)", "mode": "${{ parameters.mode }}"}}
+    "@ | Set-Content -Encoding ascii run.json
+    $start = databricks jobs run-now --json "@run.json" --no-wait -o json | Out-String
+    if ($LASTEXITCODE -ne 0) { Fail "could not start the run (exit $LASTEXITCODE)" }
+    $runId = ($start | ConvertFrom-Json).run_id
+    if (-not $runId) { Fail "no run_id returned: $start" }
+
+    # poll until the run ends (it may first wait in the job's queue behind another run)
+    $deadline = (Get-Date).AddMinutes(45)
+    $shown = $false
+    do {
+      $run = databricks jobs get-run $runId -o json | Out-String | ConvertFrom-Json
+      if (-not $shown) { Write-Host "run page       : $($run.run_page_url)"; $shown = $true }
+      $life = $run.state.life_cycle_state
+      Write-Host "[$(Get-Date -Format 'HH:mm:ss')] state: $life"
+      if ($life -in @("TERMINATED", "SKIPPED", "INTERNAL_ERROR")) { break }
+      if ((Get-Date) -gt $deadline) { Fail "run $runId still $life after 45 min — see $($run.run_page_url)" }
+      Start-Sleep -Seconds 30
+    } while ($true)
+
+    $result = $run.state.result_state
+    Write-Host "result         : $result"
+    if ($run.state.state_message) { Write-Host "message        : $($run.state.state_message)" }
+
+    # Notebook output -> HTML artifact, also when the run failed (it then shows the failing cell).
+    # export-run needs the TASK run id (the job has one task), not the job run id.
+    $taskRunId = @($run.tasks)[0].run_id
+    if ($taskRunId) {
+      Log "Export notebook output (task run $taskRunId)"
+      $dir  = "$(Build.ArtifactStagingDirectory)\reconcile-${{ parameters.mode }}"
+      $json = "$(Agent.TempDirectory)\export-run.json"
+      $html = "$dir\reconcile-${{ parameters.mode }}.html"
+      New-Item -ItemType Directory -Force $dir | Out-Null
+      # cmd redirect keeps the CLI's bytes as-is; python extracts the HTML (PowerShell 5.1's
+      # ConvertFrom-Json rejects inputs over ~2 MB, and the export can be larger)
+      cmd /c "databricks jobs export-run $taskRunId --views-to-export CODE -o json > $json"
+      if ($LASTEXITCODE -eq 0) {
+        python -c "import json,sys; v=json.load(open(sys.argv[1],encoding='utf-8-sig'))['views'][0]; open(sys.argv[2],'w',encoding='utf-8').write(v['content'])" $json $html
+      }
+      if ($LASTEXITCODE -eq 0 -and (Test-Path $html)) {
+        Write-Host "##vso[artifact.upload containerfolder=reconcile-${{ parameters.mode }};artifactname=reconcile-${{ parameters.mode }}]$html"
+        Write-Host ("notebook output: artifact 'reconcile-${{ parameters.mode }}' -> reconcile-${{ parameters.mode }}.html ({0:N0} KB)" -f ((Get-Item $html).Length / 1KB))
+      } else {
+        Write-Host "##[warning]could not export the notebook output (exit $LASTEXITCODE) — see the run page instead"
+      }
+    }
+
+    if ($result -ne "SUCCESS") { Fail "reconcile ${{ parameters.mode }} $result — see $($run.run_page_url)" }
+    Log "Reconcile ${{ parameters.mode }} done — see the run page: $($run.run_page_url)"
+  displayName: ${{ parameters.displayName }}
+  condition: ${{ parameters.condition }}
+  env:
+    DATABRICKS_HOST: $(adb)
+    DATABRICKS_TOKEN: $(accessToken)

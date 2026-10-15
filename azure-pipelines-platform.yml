@@ -166,11 +166,14 @@ jobs:
       function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
       function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
 
-      $apply = if ("$(mode)" -eq "apply") { @("--apply") } else { @() }
+      # build the arguments as a real array (an `if` returning @("--apply") unrolls to a string,
+      # and splatting a string passes it one character at a time)
+      $cmdArgs = @("groups", "--reference", "reference\$(env).yaml")
+      if ("$(mode)" -eq "apply") { $cmdArgs += "--apply" }
       Log "Provision groups ($("$(mode)".ToUpper())) from reference\$(env).yaml"
-      Write-Host "command        : ucgov-provision groups --reference reference\$(env).yaml $apply"
-      ucgov-provision groups --reference "reference\$(env).yaml" @apply
-      if ($LASTEXITCODE -ne 0) { Fail "provision groups failed (exit $LASTEXITCODE) — see FAILED / CONFLICT above" }
+      Write-Host "command        : ucgov-provision $($cmdArgs -join ' ')"
+      ucgov-provision @cmdArgs
+      if ($LASTEXITCODE -ne 0) { Fail "provision groups failed (exit $LASTEXITCODE) — see the output above" }
       Log "Groups $(if ("$(mode)" -eq 'apply') { 'provisioned' } else { 'planned' })"
     displayName: '5. Provision Groups'
     env:
@@ -181,11 +184,14 @@ jobs:
       function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
       function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
 
-      $apply = if ("$(mode)" -eq "apply") { @("--apply") } else { @() }
+      # build the arguments as a real array (an `if` returning @("--apply") unrolls to a string,
+      # and splatting a string passes it one character at a time)
+      $cmdArgs = @("schemas", "--reference", "reference\$(env).yaml")
+      if ("$(mode)" -eq "apply") { $cmdArgs += "--apply" }
       Log "Provision schemas ($("$(mode)".ToUpper())) from reference\$(env).yaml"
-      Write-Host "command        : ucgov-provision schemas --reference reference\$(env).yaml $apply"
-      ucgov-provision schemas --reference "reference\$(env).yaml" @apply
-      if ($LASTEXITCODE -ne 0) { Fail "provision schemas failed (exit $LASTEXITCODE) — see FAILED above" }
+      Write-Host "command        : ucgov-provision $($cmdArgs -join ' ')"
+      ucgov-provision @cmdArgs
+      if ($LASTEXITCODE -ne 0) { Fail "provision schemas failed (exit $LASTEXITCODE) — see the output above" }
       Log "Schemas $(if ("$(mode)" -eq 'apply') { 'provisioned' } else { 'planned' })"
     displayName: '6. Provision Schemas'
     env:

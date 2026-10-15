@@ -1,0 +1,233 @@
+# eastspring-governance-configs — platform pipeline: everything the reconcile needs to exist first.
+# Downloads the eastspring-uc-governance wheel built by pipeline 8050, validates config/esg against
+# reference/esg.yaml, then, in dependency order:
+#   groups  (ucgov-provision groups)   — account groups from the reference (needs workspace admin)
+#   schemas (ucgov-provision schemas)  — governance + serving schemas under target_catalog
+#   functions (ucgov-apply-functions)  — mask UDFs + group_portfolio_access MV (uses both above)
+# Provisioning is additive only: nothing is ever deleted. Runs when reference/ changes (PR into
+# main + merge to main) and by hand; reconcile (azure-pipelines.yml) runs on every config change.
+# Everything is a PLAN for now (changes nothing). mainMode is the one switch for merges to main —
+# pull requests always plan.
+
+trigger:                              # merges to main that change the reference
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - reference/*
+      - azure-pipelines-platform.yml
+
+pr:                                   # pull requests INTO main that change the reference
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - reference/*
+      - azure-pipelines-platform.yml
+
+# Also re-run when a new wheel is built (the function SQL ships inside it): fill in the NAME of
+# pipeline 8050 as shown in Azure DevOps (a pipeline resource takes the name, not the id), then
+# uncomment.
+# resources:
+#   pipelines:
+#     - pipeline: wheel
+#       project: eisgheradp
+#       source: '<name of pipeline 8050>'
+#       trigger:
+#         branches:
+#           include:
+#             - main
+
+variables:
+  - group: DEV-HERA-REPLATFORM        # adb (workspace URL), accessToken (secret)
+  - name: cliVersion
+    value: 1.19.0
+  - name: configRoot                  # the reference is deployed to <configRoot>/<env>/<yyyyMMdd>-[pr<id>-]<build id>-<short sha>
+    value: /Workspace/Users/xieming.li@eastspring.com/configs
+  - name: wheelPipelineId             # the build pipeline that publishes artifact "wheels"
+    value: 8050
+  - name: wheelProject
+    value: eisgheradp
+  - name: env
+    value: esg
+  - name: functionsJob                # created / updated by the wheel pipeline (jobs/ucgov_apply_functions.json)
+    value: ucgov-apply-functions
+  - name: mainMode                    # merges to main: plan | apply (change to apply later)
+    value: plan
+
+pool:
+  name: sgesss-nprd-dev
+
+# Safety net on top of `pr:` above: a PR build into any branch other than main is skipped.
+# (System.PullRequest.TargetBranch is "main" for GitHub, "refs/heads/main" for Azure Repos.)
+jobs:
+- job: platform
+  displayName: 'Provision Groups + Schemas, Apply Functions'
+  condition: or(ne(variables['Build.Reason'], 'PullRequest'), in(variables['System.PullRequest.TargetBranch'], 'main', 'refs/heads/main'))
+  steps:
+  - task: DownloadPipelineArtifact@2
+    displayName: '1. Download Wheel (pipeline $(wheelPipelineId), latest main)'
+    inputs:
+      source: specific
+      project: $(wheelProject)
+      pipeline: $(wheelPipelineId)
+      runVersion: latestFromBranch       # newest successful run of...
+      runBranch: refs/heads/main         # ...this branch
+      artifact: wheels
+      path: $(Pipeline.Workspace)\wheels
+
+  - powershell: |
+      function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
+      function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
+
+      $whl = Get-ChildItem "$(Pipeline.Workspace)\wheels\*.whl" | Select-Object -First 1
+      if (-not $whl) { Fail "no .whl in $(Pipeline.Workspace)\wheels" }
+      Log "Downloaded wheel"
+      Write-Host "wheel          : $($whl.Name) ($([math]::Round($whl.Length / 1KB)) KB)"
+
+      Log "Fresh venv + install wheel"
+      Remove-Item -Recurse -Force ucgov_venv -ErrorAction SilentlyContinue
+      python -m venv ucgov_venv
+      .\ucgov_venv\Scripts\Activate.ps1
+      Write-Host "python         : $(python --version)"
+      Write-Host "##[group]pip install output"
+      python -m pip install $whl.FullName
+      $rc = $LASTEXITCODE
+      Write-Host "##[endgroup]"
+      if ($rc -ne 0) { Fail "pip install failed (exit $rc)" }
+      Write-Host "installed      : $((python -m pip show eastspring-uc-governance | Select-String '^Version').ToString())"
+      # later steps run in new processes: put the venv's scripts (ucgov-*) on their PATH
+      Write-Host "##vso[task.prependpath]$(System.DefaultWorkingDirectory)\ucgov_venv\Scripts"
+
+      # one place that decides plan | apply: pull requests always plan, merges use mainMode
+      $mode = if ($env:BUILD_REASON -eq "PullRequest") { "plan" } else { "$(mainMode)" }
+      Write-Host "##vso[task.setvariable variable=mode]$mode"
+      Write-Host "build reason   : $env:BUILD_REASON"
+      Write-Host "mode           : $mode$(if ($mode -eq 'plan') { '   (dry run — changes nothing)' })"
+    displayName: '2. Install Wheel'
+
+  - powershell: |
+      function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
+      function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
+
+      # a reference change can break the config (e.g. a group the config grants to was removed)
+      Log "Validate config\$(env) against reference\$(env).yaml"
+      ucgov-validate "config\$(env)" --reference "reference\$(env).yaml" --verbose
+      if ($LASTEXITCODE -ne 0) { Fail "validation failed (exit $LASTEXITCODE) — see the issues above" }
+      Log "Config + reference valid"
+    displayName: '3. Validate Config Against Reference'
+
+  - powershell: |
+      function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
+      function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
+
+      $dir = "$(Agent.ToolsDirectory)\databricks-cli\$(cliVersion)"
+      Log "Databricks CLI $(cliVersion) -> $dir"
+      if (Test-Path "$dir\databricks.exe") {
+        Write-Host "already cached on this agent — skipping download"
+      } else {
+        $url = "https://github.com/databricks/cli/releases/download/v$(cliVersion)/databricks_cli_$(cliVersion)_windows_amd64.zip"
+        $zip = "$(Agent.TempDirectory)\databricks.zip"
+        Write-Host "downloading    : $url"
+        Invoke-WebRequest -Uri $url -OutFile $zip
+        Expand-Archive $zip -DestinationPath $dir -Force
+      }
+      if (-not (Test-Path "$dir\databricks.exe")) { Fail "databricks.exe not found in $dir" }
+      Write-Host "##vso[task.prependpath]$dir"
+      Write-Host "version        : $(& "$dir\databricks.exe" version)"
+      $me = & "$dir\databricks.exe" current-user me -o json | ConvertFrom-Json
+      if ($LASTEXITCODE -ne 0) { Fail "authentication failed — check adb / accessToken" }
+      Write-Host "workspace      : $env:DATABRICKS_HOST"
+      Write-Host "running as     : $($me.userName) (id $($me.id))"
+    displayName: '4. Install Databricks CLI $(cliVersion)'
+    env:
+      DATABRICKS_HOST: $(adb)
+      DATABRICKS_TOKEN: $(accessToken)
+
+  # groups before schemas before functions: the functions' unmasked condition names the groups,
+  # and they are created in the governance schema
+  - powershell: |
+      function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
+      function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
+
+      $apply = if ("$(mode)" -eq "apply") { @("--apply") } else { @() }
+      Log "Provision groups ($("$(mode)".ToUpper())) from reference\$(env).yaml"
+      Write-Host "command        : ucgov-provision groups --reference reference\$(env).yaml $apply"
+      ucgov-provision groups --reference "reference\$(env).yaml" @apply
+      if ($LASTEXITCODE -ne 0) { Fail "provision groups failed (exit $LASTEXITCODE) — see FAILED / CONFLICT above" }
+      Log "Groups $(if ("$(mode)" -eq 'apply') { 'provisioned' } else { 'planned' })"
+    displayName: '5. Provision Groups'
+    env:
+      DATABRICKS_HOST: $(adb)
+      DATABRICKS_TOKEN: $(accessToken)
+
+  - powershell: |
+      function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
+      function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
+
+      $apply = if ("$(mode)" -eq "apply") { @("--apply") } else { @() }
+      Log "Provision schemas ($("$(mode)".ToUpper())) from reference\$(env).yaml"
+      Write-Host "command        : ucgov-provision schemas --reference reference\$(env).yaml $apply"
+      ucgov-provision schemas --reference "reference\$(env).yaml" @apply
+      if ($LASTEXITCODE -ne 0) { Fail "provision schemas failed (exit $LASTEXITCODE) — see FAILED above" }
+      Log "Schemas $(if ("$(mode)" -eq 'apply') { 'provisioned' } else { 'planned' })"
+    displayName: '6. Provision Schemas'
+    env:
+      DATABRICKS_HOST: $(adb)
+      DATABRICKS_TOKEN: $(accessToken)
+
+  - powershell: |
+      function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
+      function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
+
+      # same versioned folder scheme as azure-pipelines.yml, but only the reference is deployed:
+      #   .../configs/esg/20261015-48230-a1b2c3d/reference/esg.yaml
+      $isPr   = $env:BUILD_REASON -eq "PullRequest"
+      $commit = if ($isPr -and $env:SYSTEM_PULLREQUEST_SOURCECOMMITID) { $env:SYSTEM_PULLREQUEST_SOURCECOMMITID } else { "$(Build.SourceVersion)" }
+      $date   = (Get-Date).ToUniversalTime().ToString("yyyyMMdd")
+      $prNum  = if ($env:SYSTEM_PULLREQUEST_PULLREQUESTNUMBER) { $env:SYSTEM_PULLREQUEST_PULLREQUESTNUMBER } else { $env:SYSTEM_PULLREQUEST_PULLREQUESTID }
+      $pr     = if ($isPr) { "pr$prNum-" } else { "" }
+      $target = "$(configRoot)/$(env)/$date-$pr$(Build.BuildId)-$($commit.Substring(0, 7))"
+      Log "Deploy reference"
+      Write-Host "build reason   : $env:BUILD_REASON$(if ($isPr) { " (PR $prNum)" })"
+      Write-Host "commit         : $commit"
+      Write-Host "target         : $target"
+
+      databricks workspace mkdirs "$target/reference"
+      if ($LASTEXITCODE -ne 0) { Fail "could not create $target (exit $LASTEXITCODE)" }
+      databricks workspace import "$target/reference/$(env).yaml" --file "reference\$(env).yaml" --format AUTO --overwrite
+      if ($LASTEXITCODE -ne 0) { Fail "reference upload failed (exit $LASTEXITCODE)" }
+      Write-Host "##[group]deployed files"
+      databricks workspace list "$target/reference"
+      Write-Host "##[endgroup]"
+
+      Write-Host "##vso[task.setvariable variable=referencePath]$target/reference/$(env).yaml"
+      Write-Host "reference_path : $target/reference/$(env).yaml"
+      Log "Reference deployed"
+    displayName: '7. Deploy Reference to Workspace'
+    env:
+      DATABRICKS_HOST: $(adb)
+      DATABRICKS_TOKEN: $(accessToken)
+
+  # 8. Apply functions — pull requests always plan; merges to main follow mainMode.
+  - template: templates/run-job.yml
+    parameters:
+      displayName: '8a. Apply Functions Plan (pull request)'
+      condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), in(variables['System.PullRequest.TargetBranch'], 'main', 'refs/heads/main'))
+      job: $(functionsJob)
+      label: functions
+      mode: plan
+      jobParameters:
+        reference_path: $(referencePath)
+
+  - template: templates/run-job.yml
+    parameters:
+      displayName: '8b. Apply Functions ${{ variables.mainMode }} (main)'
+      condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+      job: $(functionsJob)
+      label: functions
+      mode: ${{ variables.mainMode }}
+      jobParameters:
+        reference_path: $(referencePath)

@@ -1,39 +1,49 @@
-# Run the ucgov-reconcile Databricks job against the config deployed by step 6, wait for it, and
-# publish the notebook's full output (every cell, print and table) as an HTML artifact
-# "reconcile-<mode>". Used twice by azure-pipelines.yml (pull request + merge to main).
+# Run a ucgov Databricks job (created by the wheel pipeline), wait for it, and publish the
+# notebook's full output (every cell, print and table) as an HTML artifact "<label>-<mode>".
+# Used by azure-pipelines.yml (reconcile) and azure-pipelines-platform.yml (apply functions).
+# `mode` is always passed as a job parameter; `jobParameters` are the rest, e.g.
+#   jobParameters:
+#     reference_path: $(referencePath)
 parameters:
   - name: displayName
     type: string
   - name: condition
     type: string
+  - name: job                         # Databricks job name, e.g. ucgov-reconcile
+    type: string
+  - name: label                       # short name for logs + the artifact, e.g. reconcile
+    type: string
   - name: mode                        # plan = dry run (changes nothing) | apply
     type: string
     values: [plan, apply]
+  - name: jobParameters               # job parameters other than mode
+    type: object
+    default: {}
 
 steps:
 - powershell: |
     function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
     function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
 
-    Log "Find job $(reconcileJob)"
-    $raw = databricks jobs list --name "$(reconcileJob)" -o json | Out-String
+    Log "Find job ${{ parameters.job }}"
+    $raw = databricks jobs list --name "${{ parameters.job }}" -o json | Out-String
     if ($LASTEXITCODE -ne 0) { Fail "could not list jobs (exit $LASTEXITCODE)" }
     $found = @()
     if (-not [string]::IsNullOrWhiteSpace($raw)) {
       $found = @(@($raw | ConvertFrom-Json) | ForEach-Object { $_ } | Where-Object { $_.job_id })
     }
-    if ($found.Count -ne 1) { Fail "expected 1 job named '$(reconcileJob)', found $($found.Count) — run the wheel pipeline to create it" }
+    if ($found.Count -ne 1) { Fail "expected 1 job named '${{ parameters.job }}', found $($found.Count) — run the wheel pipeline to create it" }
     $jobId = $found[0].job_id
-    Write-Host "job            : $(reconcileJob) (id $jobId)"
+    Write-Host "job            : ${{ parameters.job }} (id $jobId)"
 
-    Log "Start reconcile $("${{ parameters.mode }}".ToUpper())"
-    Write-Host "config_path    : $(configPath)"
-    Write-Host "reference_path : $(referencePath)"
-    Write-Host "mode           : ${{ parameters.mode }}$(if ('${{ parameters.mode }}' -eq 'plan') { '   (dry run — changes nothing)' })"
-    @"
-    {"job_id": $jobId,
-     "job_parameters": {"config_path": "$(configPath)", "reference_path": "$(referencePath)", "mode": "${{ parameters.mode }}"}}
-    "@ | Set-Content -Encoding ascii run.json
+    Log "Start ${{ parameters.label }} $("${{ parameters.mode }}".ToUpper())"
+    $params = @'
+    ${{ convertToJson(parameters.jobParameters) }}
+    '@ | ConvertFrom-Json
+    $params | Add-Member -NotePropertyName mode -NotePropertyValue '${{ parameters.mode }}' -Force
+    foreach ($p in $params.PSObject.Properties) { Write-Host ("{0,-15}: {1}" -f $p.Name, $p.Value) }
+    if ('${{ parameters.mode }}' -eq 'plan') { Write-Host "                 (dry run — changes nothing)" }
+    @{ job_id = $jobId; job_parameters = $params } | ConvertTo-Json -Compress | Set-Content -Encoding ascii run.json
     $start = databricks jobs run-now --json "@run.json" --no-wait -o json | Out-String
     if ($LASTEXITCODE -ne 0) { Fail "could not start the run (exit $LASTEXITCODE)" }
     $runId = ($start | ConvertFrom-Json).run_id
@@ -58,12 +68,13 @@ steps:
 
     # Notebook output -> HTML artifact, also when the run failed (it then shows the failing cell).
     # export-run needs the TASK run id (the job has one task), not the job run id.
+    $artifact  = "${{ parameters.label }}-${{ parameters.mode }}"
     $taskRunId = @($run.tasks)[0].run_id
     if ($taskRunId) {
       Log "Export notebook output (task run $taskRunId)"
-      $dir  = "$(Build.ArtifactStagingDirectory)\reconcile-${{ parameters.mode }}"
+      $dir  = "$(Build.ArtifactStagingDirectory)\$artifact"
       $json = "$(Agent.TempDirectory)\export-run.json"
-      $html = "$dir\reconcile-${{ parameters.mode }}.html"
+      $html = "$dir\$artifact.html"
       New-Item -ItemType Directory -Force $dir | Out-Null
       # cmd redirect keeps the CLI's bytes as-is; python extracts the HTML (PowerShell 5.1's
       # ConvertFrom-Json rejects inputs over ~2 MB, and the export can be larger)
@@ -72,15 +83,16 @@ steps:
         python -c "import json,sys; v=json.load(open(sys.argv[1],encoding='utf-8-sig'))['views'][0]; open(sys.argv[2],'w',encoding='utf-8').write(v['content'])" $json $html
       }
       if ($LASTEXITCODE -eq 0 -and (Test-Path $html)) {
-        Write-Host "##vso[artifact.upload containerfolder=reconcile-${{ parameters.mode }};artifactname=reconcile-${{ parameters.mode }}]$html"
-        Write-Host ("notebook output: artifact 'reconcile-${{ parameters.mode }}' -> reconcile-${{ parameters.mode }}.html ({0:N0} KB)" -f ((Get-Item $html).Length / 1KB))
+        Write-Host "##vso[artifact.upload containerfolder=$artifact;artifactname=$artifact]$html"
+        Write-Host ("notebook output: artifact '$artifact' -> $artifact.html ({0:N0} KB)" -f ((Get-Item $html).Length / 1KB))
       } else {
         Write-Host "##[warning]could not export the notebook output (exit $LASTEXITCODE) — see the run page instead"
       }
     }
 
-    if ($result -ne "SUCCESS") { Fail "reconcile ${{ parameters.mode }} $result — see $($run.run_page_url)" }
-    Log "Reconcile ${{ parameters.mode }} done — see the run page: $($run.run_page_url)"
+    if ($result -ne "SUCCESS") { Fail "${{ parameters.label }} ${{ parameters.mode }} $result — see $($run.run_page_url)" }
+    Log "${{ parameters.label }} ${{ parameters.mode }} done — see the run page: $($run.run_page_url)"
+    exit 0                              # a failed export above is only a warning, not a step failure
   displayName: ${{ parameters.displayName }}
   condition: ${{ parameters.condition }}
   env:

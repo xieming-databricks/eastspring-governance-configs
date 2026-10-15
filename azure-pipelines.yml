@@ -27,8 +27,8 @@ variables:
     value: eisgheradp
   - name: env
     value: esg
-  - name: workbook
-    value: excels\esg\access-matrix-esg_workshop-v3-dynamic-views.xlsx
+  # - name: workbook
+  #   value: excels\esg\access-matrix-esg_workshop-v3-dynamic-views.xlsx
   - name: reconcileJob                # created / updated by the wheel pipeline (jobs/ucgov_reconcile.json)
     value: ucgov-reconcile
 
@@ -77,28 +77,28 @@ jobs:
       Write-Host "##vso[task.prependpath]$(System.DefaultWorkingDirectory)\ucgov_venv\Scripts"
     displayName: '2. Install Wheel'
 
-  - powershell: |
-      function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
-      function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
+  # - powershell: |
+  #     function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
+  #     function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
 
-      Log "Regenerate config\$(env) from $(workbook)"
-      ucgov-generate "$(workbook)" "config\$(env)"
-      if ($LASTEXITCODE -ne 0) { Fail "ucgov-generate failed (exit $LASTEXITCODE)" }
+  #     Log "Regenerate config\$(env) from $(workbook)"
+  #     ucgov-generate "$(workbook)" "config\$(env)"
+  #     if ($LASTEXITCODE -ne 0) { Fail "ucgov-generate failed (exit $LASTEXITCODE)" }
 
-      Log "Compare with the committed config\$(env)"
-      # --ignore-cr-at-eol: files written on Windows have CRLF; only real content changes count
-      $changed   = git diff --name-only --ignore-cr-at-eol -- "config/$(env)"
-      $untracked = git ls-files --others --exclude-standard -- "config/$(env)"
-      if ($changed -or $untracked) {
-        Write-Host "##[group]out-of-date files"
-        $changed   | ForEach-Object { Write-Host "changed  : $_" }
-        $untracked | ForEach-Object { Write-Host "not committed: $_" }
-        git --no-pager diff --ignore-cr-at-eol -- "config/$(env)"
-        Write-Host "##[endgroup]"
-        Fail "config\$(env) is out of date with the workbook — run ucgov-generate locally and commit the result"
-      }
-      Write-Host "config\$(env) matches the workbook"
-    displayName: '3. Check Config Is Up To Date'
+  #     Log "Compare with the committed config\$(env)"
+  #     # --ignore-cr-at-eol: files written on Windows have CRLF; only real content changes count
+  #     $changed   = git diff --name-only --ignore-cr-at-eol -- "config/$(env)"
+  #     $untracked = git ls-files --others --exclude-standard -- "config/$(env)"
+  #     if ($changed -or $untracked) {
+  #       Write-Host "##[group]out-of-date files"
+  #       $changed   | ForEach-Object { Write-Host "changed  : $_" }
+  #       $untracked | ForEach-Object { Write-Host "not committed: $_" }
+  #       git --no-pager diff --ignore-cr-at-eol -- "config/$(env)"
+  #       Write-Host "##[endgroup]"
+  #       Fail "config\$(env) is out of date with the workbook — run ucgov-generate locally and commit the result"
+  #     }
+  #     Write-Host "config\$(env) matches the workbook"
+  #   displayName: '3. Check Config Is Up To Date'
 
   - powershell: |
       function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
@@ -129,6 +129,30 @@ jobs:
       Write-Host "##vso[task.prependpath]$dir"
       Write-Host "version        : $(& "$dir\databricks.exe" version)"
     displayName: '5. Install Databricks CLI $(cliVersion)'
+
+  # Read-only: are the groups + schemas the reference lists provisioned yet? They are created by
+  # azure-pipelines-platform.yml; if one is missing, a reconcile apply would fail on it. Only a
+  # warning for now (nothing is applied yet) — change Warn to Fail once apply is switched on.
+  - powershell: |
+      function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
+      function Warn($m) { Write-Host "##vso[task.logissue type=warning]$m"; Write-Host "##vso[task.complete result=SucceededWithIssues;]" }
+
+      $missing = @()
+      foreach ($kind in "groups", "schemas") {
+        Log "Provisioned $kind (plan, read-only)"
+        $out = ucgov-provision $kind --reference "reference\$(env).yaml" | Out-String
+        $rc  = $LASTEXITCODE
+        Write-Host $out.TrimEnd()
+        if ($rc -ne 0) { Warn "ucgov-provision $kind could not check (exit $rc) — see above"; continue }
+        if ($out -match '\bPLANNED\b') { $missing += $kind }
+      }
+      if ($missing) { Warn "not yet provisioned: $($missing -join ', ') — run the platform pipeline (azure-pipelines-platform.yml) first" }
+      else { Log "All groups + schemas exist" }
+      exit 0                            # warnings only — never fail the step
+    displayName: '5b. Check Groups + Schemas Are Provisioned'
+    env:
+      DATABRICKS_HOST: $(adb)
+      DATABRICKS_TOKEN: $(accessToken)
 
   - powershell: |
       function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
@@ -181,14 +205,24 @@ jobs:
       DATABRICKS_TOKEN: $(accessToken)
 
   # 7. Reconcile — same job, two triggers. Both are a PLAN for now.
-  - template: templates/reconcile-run.yml
+  - template: templates/run-job.yml
     parameters:
       displayName: '7a. Reconcile Plan (pull request)'
       condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), in(variables['System.PullRequest.TargetBranch'], 'main', 'refs/heads/main'))
+      job: $(reconcileJob)
+      label: reconcile
       mode: plan
+      jobParameters:
+        config_path: $(configPath)
+        reference_path: $(referencePath)
 
-  - template: templates/reconcile-run.yml
+  - template: templates/run-job.yml
     parameters:
       displayName: '7b. Reconcile Plan (merge to main)'
       condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+      job: $(reconcileJob)
+      label: reconcile
       mode: plan                        # change to apply later
+      jobParameters:
+        config_path: $(configPath)
+        reference_path: $(referencePath)

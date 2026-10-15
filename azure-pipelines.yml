@@ -4,8 +4,18 @@
 # all passed — deploys both to a new, versioned folder in the Databricks workspace and runs a
 # reconcile PLAN (dry run, changes nothing) against it. Runs for pushes to main and for pull
 # requests (build validation), so the delta can be reviewed before merging.
-# Step 7 has two branches: 7a runs for pull requests, 7b for merges to main. Both are a
-# PLAN for now (no apply); 7b is the one to switch to apply later.
+# Step 7 has two branches: 7a runs for pull requests (always a plan), 7b for main, in the mode
+# chosen by the `mode` run parameter (Run pipeline -> mode: plan | apply). Triggered runs use its
+# default, plan. A manual run on any other branch runs neither.
+
+parameters:
+  - name: mode
+    displayName: 'Reconcile mode on main (plan = dry run, changes nothing)'
+    type: string
+    default: plan                     # also what triggered runs (PR / merge) get
+    values:
+      - plan
+      - apply
 
 trigger:                              # pushes (merges) to main
   - main
@@ -131,11 +141,14 @@ jobs:
     displayName: '5. Install Databricks CLI $(cliVersion)'
 
   # Read-only: are the groups + schemas the reference lists provisioned yet? They are created by
-  # azure-pipelines-platform.yml; if one is missing, a reconcile apply would fail on it. Only a
-  # warning for now (nothing is applied yet) — change Warn to Fail once apply is switched on.
+  # azure-pipelines-platform.yml; if one is missing, a reconcile apply would fail on it. A warning
+  # when 7b only plans; an error when this run will apply (mode=apply on main).
   - powershell: |
       function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
+      function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
       function Warn($m) { Write-Host "##vso[task.logissue type=warning]$m"; Write-Host "##vso[task.complete result=SucceededWithIssues;]" }
+      $applying = "${{ parameters.mode }}" -eq "apply" -and $env:BUILD_REASON -ne "PullRequest" -and "$(Build.SourceBranch)" -eq "refs/heads/main"
+      Write-Host "reconcile      : $(if ($applying) { 'APPLY — a missing group / schema is an error' } else { 'plan — a missing group / schema is a warning' })"
 
       $missing = @()
       foreach ($kind in "groups", "schemas") {
@@ -143,12 +156,19 @@ jobs:
         $out = ucgov-provision $kind --reference "reference\$(env).yaml" | Out-String
         $rc  = $LASTEXITCODE
         Write-Host $out.TrimEnd()
-        if ($rc -ne 0) { Warn "ucgov-provision $kind could not check (exit $rc) — see above"; continue }
+        if ($rc -ne 0) {
+          if ($applying) { Fail "ucgov-provision $kind could not check (exit $rc) — see above" }
+          Warn "ucgov-provision $kind could not check (exit $rc) — see above"; continue
+        }
         if ($out -match '\bPLANNED\b') { $missing += $kind }
       }
-      if ($missing) { Warn "not yet provisioned: $($missing -join ', ') — run the platform pipeline (azure-pipelines-platform.yml) first" }
+      if ($missing) {
+        $msg = "not yet provisioned: $($missing -join ', ') — run the platform pipeline (azure-pipelines-platform.yml) first"
+        if ($applying) { Fail $msg }
+        Warn $msg
+      }
       else { Log "All groups + schemas exist" }
-      exit 0                            # warnings only — never fail the step
+      exit 0                            # only Fail above fails the step
     displayName: '5b. Check Groups + Schemas Are Provisioned'
     env:
       DATABRICKS_HOST: $(adb)
@@ -204,7 +224,7 @@ jobs:
       DATABRICKS_HOST: $(adb)
       DATABRICKS_TOKEN: $(accessToken)
 
-  # 7. Reconcile — same job, two triggers. Both are a PLAN for now.
+  # 7. Reconcile — pull requests always plan; runs on main use the mode parameter.
   - template: templates/run-job.yml
     parameters:
       displayName: '7a. Reconcile Plan (pull request)'
@@ -218,11 +238,11 @@ jobs:
 
   - template: templates/run-job.yml
     parameters:
-      displayName: '7b. Reconcile Plan (merge to main)'
+      displayName: '7b. Reconcile ${{ parameters.mode }} (main)'
       condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
       job: $(reconcileJob)
       label: reconcile
-      mode: plan                        # change to apply later
+      mode: ${{ parameters.mode }}
       jobParameters:
         config_path: $(configPath)
         reference_path: $(referencePath)

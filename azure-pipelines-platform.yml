@@ -6,8 +6,18 @@
 #   functions (ucgov-apply-functions)  — mask UDFs + group_portfolio_access MV (uses both above)
 # Provisioning is additive only: nothing is ever deleted. Runs when reference/ changes (PR into
 # main + merge to main) and by hand; reconcile (azure-pipelines.yml) runs on every config change.
-# Everything is a PLAN for now (changes nothing). mainMode is the one switch for merges to main —
-# pull requests always plan.
+# Mode: the `mode` run parameter (Run pipeline -> mode: plan | apply). Triggered runs use its
+# default, plan. Pull requests always plan, and apply only ever runs from main — anything else
+# falls back to plan.
+
+parameters:
+  - name: mode
+    displayName: 'Mode (plan = dry run, changes nothing)'
+    type: string
+    default: plan                     # also what triggered runs (PR / merge / wheel) get
+    values:
+      - plan
+      - apply
 
 trigger:                              # merges to main that change the reference
   branches:
@@ -54,8 +64,6 @@ variables:
     value: esg
   - name: functionsJob                # created / updated by the wheel pipeline (jobs/ucgov_apply_functions.json)
     value: ucgov-apply-functions
-  - name: mainMode                    # merges to main: plan | apply (change to apply later)
-    value: plan
 
 pool:
   name: sgesss-nprd-dev
@@ -101,10 +109,16 @@ jobs:
       # later steps run in new processes: put the venv's scripts (ucgov-*) on their PATH
       Write-Host "##vso[task.prependpath]$(System.DefaultWorkingDirectory)\ucgov_venv\Scripts"
 
-      # one place that decides plan | apply: pull requests always plan, merges use mainMode
-      $mode = if ($env:BUILD_REASON -eq "PullRequest") { "plan" } else { "$(mainMode)" }
+      # one place that decides plan | apply for the provision steps: the run parameter, except
+      # that pull requests and branches other than main always plan
+      $mode = "${{ parameters.mode }}"
+      if ($mode -eq "apply" -and ($env:BUILD_REASON -eq "PullRequest" -or "$(Build.SourceBranch)" -ne "refs/heads/main")) {
+        Write-Host "##[warning]mode=apply is only allowed on main (this run: $env:BUILD_REASON, $(Build.SourceBranch)) — running plan instead"
+        $mode = "plan"
+      }
       Write-Host "##vso[task.setvariable variable=mode]$mode"
-      Write-Host "build reason   : $env:BUILD_REASON"
+      Write-Host "build reason   : $env:BUILD_REASON ($(Build.SourceBranch))"
+      Write-Host "requested mode : ${{ parameters.mode }}"
       Write-Host "mode           : $mode$(if ($mode -eq 'plan') { '   (dry run — changes nothing)' })"
     displayName: '2. Install Wheel'
 
@@ -211,7 +225,7 @@ jobs:
       DATABRICKS_HOST: $(adb)
       DATABRICKS_TOKEN: $(accessToken)
 
-  # 8. Apply functions — pull requests always plan; merges to main follow mainMode.
+  # 8. Apply functions — pull requests always plan; runs on main use the mode parameter.
   - template: templates/run-job.yml
     parameters:
       displayName: '8a. Apply Functions Plan (pull request)'
@@ -224,10 +238,10 @@ jobs:
 
   - template: templates/run-job.yml
     parameters:
-      displayName: '8b. Apply Functions ${{ variables.mainMode }} (main)'
+      displayName: '8b. Apply Functions ${{ parameters.mode }} (main)'
       condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
       job: $(functionsJob)
       label: functions
-      mode: ${{ variables.mainMode }}
+      mode: ${{ parameters.mode }}
       jobParameters:
         reference_path: $(referencePath)

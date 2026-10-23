@@ -64,6 +64,8 @@ variables:
     value: 8050
   - name: wheelProject
     value: eisgheradp
+  - name: minWheelVersion             # this repo needs at least this eastspring-uc-governance (e.g. --sql, --verify)
+    value: 0.3.0
   - name: domain                      # e.g. esg
     value: esg
   - name: envName                     # dev | sit | uat | prod — this pipeline's workspace (variable group above)
@@ -92,14 +94,17 @@ jobs:
       runVersion: latestFromBranch       # newest successful run of...
       runBranch: refs/heads/main         # ...this branch
       artifact: wheels
-      path: $(Pipeline.Workspace)\wheels
+      # Agent.TempDirectory is emptied after every job: a wheel from an earlier run can never be
+      # picked up instead (Pipeline.Workspace is reused across runs on the same agent)
+      path: $(Agent.TempDirectory)\wheels
 
   - powershell: |
       function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
       function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
 
-      $whl = Get-ChildItem "$(Pipeline.Workspace)\wheels\*.whl" | Select-Object -First 1
-      if (-not $whl) { Fail "no .whl in $(Pipeline.Workspace)\wheels" }
+      $all = @(Get-ChildItem "$(Agent.TempDirectory)\wheels\*.whl")
+      if ($all.Count -ne 1) { Fail "expected exactly 1 .whl in $(Agent.TempDirectory)\wheels, found $($all.Count): $($all.Name -join ', ')" }
+      $whl = $all[0]
       Log "Downloaded wheel"
       Write-Host "wheel          : $($whl.Name) ($([math]::Round($whl.Length / 1KB)) KB)"
 
@@ -113,7 +118,13 @@ jobs:
       $rc = $LASTEXITCODE
       Write-Host "##[endgroup]"
       if ($rc -ne 0) { Fail "pip install failed (exit $rc)" }
-      Write-Host "installed      : $((python -m pip show eastspring-uc-governance | Select-String '^Version').ToString())"
+      $installed = ((python -m pip show eastspring-uc-governance | Select-String '^Version').ToString() -replace '^Version:\s*', '').Trim()
+      Write-Host "installed      : $installed (this repo needs >= $(minWheelVersion))"
+      # step 1 takes the newest SUCCESSFUL main run of pipeline $(wheelPipelineId): a failed build
+      # publishes no wheel, so an older one is picked up — stop here, not in a later step
+      if ([version]$installed -lt [version]"$(minWheelVersion)") {
+        Fail "wheel $installed is older than $(minWheelVersion) — the newest successful main run of pipeline $(wheelPipelineId) still has the old version; fix / rerun that build first"
+      }
       # later steps run in new processes: put the venv's scripts (ucgov-*) on their PATH
       Write-Host "##vso[task.prependpath]$(System.DefaultWorkingDirectory)\ucgov_venv\Scripts"
 

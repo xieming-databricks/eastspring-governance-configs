@@ -1,11 +1,13 @@
-# eastspring-governance-configs — platform pipeline: everything the reconcile needs to exist first.
-# Downloads the eastspring-uc-governance wheel built by pipeline 8050, validates config/esg against
-# reference/esg.yaml, then, in dependency order:
+# eastspring-governance-configs — platform pipeline: everything the reconcile needs to exist first,
+# for one deployment <domain>-<envName> (e.g. esg-dev; see azure-pipelines.yml for the layout).
+# Downloads the eastspring-uc-governance wheel built by pipeline 8050, validates config/<deployment>
+# against reference/<deployment>.yaml + sql/<deployment>, then, in dependency order:
 #   groups  (ucgov-provision groups)   — account groups from the reference (needs workspace admin)
 #   schemas (ucgov-provision schemas)  — governance + serving schemas under target_catalog
-#   functions (ucgov-apply-functions)  — mask UDFs + group_portfolio_access MV (uses both above)
-# Provisioning is additive only: nothing is ever deleted. Runs when reference/ changes (PR into
-# main + merge to main) and by hand; reconcile (azure-pipelines.yml) runs on every config change.
+#   tags    (ucgov-provision tags)     — governed tags + allowed values (the ABAC policies match on them)
+#   functions (ucgov-apply-functions)  — mask UDFs + group_portfolio_access MV from sql/<deployment> (uses groups + schemas)
+# Provisioning is additive only: nothing is ever deleted. Runs when reference/ or sql/ changes (PR
+# into main + merge to main) and by hand; reconcile (azure-pipelines.yml) runs on every config change.
 # Mode: the `mode` run parameter (Run pipeline -> mode: plan | apply). Triggered runs use its
 # default, plan. Pull requests always plan, and apply only ever runs from main — anything else
 # falls back to plan.
@@ -19,25 +21,27 @@ parameters:
       - plan
       - apply
 
-trigger:                              # merges to main that change the reference
+trigger:                              # merges to main that change the reference or the SQL
   branches:
     include:
       - main
   paths:
     include:
-      - reference/*
+      - reference                     # folder prefixes: every file below them
+      - sql
       - azure-pipelines-platform.yml
 
-pr:                                   # pull requests INTO main that change the reference
+pr:                                   # pull requests INTO main that change the reference or the SQL
   branches:
     include:
       - main
   paths:
     include:
-      - reference/*
+      - reference                     # folder prefixes: every file below them
+      - sql
       - azure-pipelines-platform.yml
 
-# Also re-run when a new wheel is built (the function SQL ships inside it): fill in the NAME of
+# Also re-run when a new wheel is built (it renders + applies the SQL): fill in the NAME of
 # pipeline 8050 as shown in Azure DevOps (a pipeline resource takes the name, not the id), then
 # uncomment.
 # resources:
@@ -54,14 +58,18 @@ variables:
   - group: DEV-HERA-REPLATFORM        # adb (workspace URL), accessToken (secret)
   - name: cliVersion
     value: 1.19.0
-  - name: configRoot                  # the reference is deployed to <configRoot>/<env>/<yyyyMMdd>-[pr<id>-]<build id>-<short sha>
+  - name: configRoot                  # reference + sql are deployed to <configRoot>/<deployment>/<yyyyMMdd>-[pr<id>-]<build id>-<short sha>
     value: /Workspace/Users/xieming.li@eastspring.com/configs
   - name: wheelPipelineId             # the build pipeline that publishes artifact "wheels"
     value: 8050
   - name: wheelProject
     value: eisgheradp
-  - name: env
+  - name: domain                      # e.g. esg
     value: esg
+  - name: envName                     # dev | sit | uat | prod — this pipeline's workspace (variable group above)
+    value: dev
+  - name: deployment                  # excels/, config/, reference/ and sql/ are all per deployment
+    value: $(domain)-$(envName)
   - name: functionsJob                # created / updated by the wheel pipeline (jobs/ucgov_apply_functions.json)
     value: ucgov-apply-functions
 
@@ -72,7 +80,7 @@ pool:
 # (System.PullRequest.TargetBranch is "main" for GitHub, "refs/heads/main" for Azure Repos.)
 jobs:
 - job: platform
-  displayName: 'Provision Groups + Schemas, Apply Functions'
+  displayName: 'Provision Groups + Schemas + Governed Tags, Apply Functions'
   condition: or(ne(variables['Build.Reason'], 'PullRequest'), in(variables['System.PullRequest.TargetBranch'], 'main', 'refs/heads/main'))
   steps:
   - task: DownloadPipelineArtifact@2
@@ -126,12 +134,13 @@ jobs:
       function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
       function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
 
-      # a reference change can break the config (e.g. a group the config grants to was removed)
-      Log "Validate config\$(env) against reference\$(env).yaml"
-      ucgov-validate "config\$(env)" --reference "reference\$(env).yaml" --verbose
+      # a reference or SQL change can break the config (e.g. a group the config grants to was
+      # removed, or a mask function a Masking Rule names was deleted)
+      Log "Validate config\$(deployment) against reference\$(deployment).yaml + sql\$(deployment)"
+      ucgov-validate "config\$(deployment)" --reference "reference\$(deployment).yaml" --sql "sql\$(deployment)" --verbose
       if ($LASTEXITCODE -ne 0) { Fail "validation failed (exit $LASTEXITCODE) — see the issues above" }
-      Log "Config + reference valid"
-    displayName: '3. Validate Config Against Reference'
+      Log "Config + reference + SQL valid"
+    displayName: '3. Validate Config, Reference + SQL'
 
   - powershell: |
       function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
@@ -161,16 +170,17 @@ jobs:
       DATABRICKS_TOKEN: $(accessToken)
 
   # groups before schemas before functions: the functions' unmasked condition names the groups,
-  # and they are created in the governance schema
+  # and they are created in the governance schema. Governed tags only have to exist before the
+  # reconcile (SET TAGS + the ABAC policies), but are provisioned here with the rest.
   - powershell: |
       function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
       function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
 
       # build the arguments as a real array (an `if` returning @("--apply") unrolls to a string,
       # and splatting a string passes it one character at a time)
-      $cmdArgs = @("groups", "--reference", "reference\$(env).yaml")
+      $cmdArgs = @("groups", "--reference", "reference\$(deployment).yaml")
       if ("$(mode)" -eq "apply") { $cmdArgs += "--apply" }
-      Log "Provision groups ($("$(mode)".ToUpper())) from reference\$(env).yaml"
+      Log "Provision groups ($("$(mode)".ToUpper())) from reference\$(deployment).yaml"
       Write-Host "command        : ucgov-provision $($cmdArgs -join ' ')"
       ucgov-provision @cmdArgs
       if ($LASTEXITCODE -ne 0) { Fail "provision groups failed (exit $LASTEXITCODE) — see the output above" }
@@ -186,9 +196,9 @@ jobs:
 
       # build the arguments as a real array (an `if` returning @("--apply") unrolls to a string,
       # and splatting a string passes it one character at a time)
-      $cmdArgs = @("schemas", "--reference", "reference\$(env).yaml")
+      $cmdArgs = @("schemas", "--reference", "reference\$(deployment).yaml")
       if ("$(mode)" -eq "apply") { $cmdArgs += "--apply" }
-      Log "Provision schemas ($("$(mode)".ToUpper())) from reference\$(env).yaml"
+      Log "Provision schemas ($("$(mode)".ToUpper())) from reference\$(deployment).yaml"
       Write-Host "command        : ucgov-provision $($cmdArgs -join ' ')"
       ucgov-provision @cmdArgs
       if ($LASTEXITCODE -ne 0) { Fail "provision schemas failed (exit $LASTEXITCODE) — see the output above" }
@@ -202,52 +212,81 @@ jobs:
       function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
       function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
 
-      # same versioned folder scheme as azure-pipelines.yml, but only the reference is deployed:
-      #   .../configs/esg/20261015-48230-a1b2c3d/reference/esg.yaml
+      # governed tags (tag policies) are account-wide: a value is only ever added, never removed
+      $cmdArgs = @("tags", "--reference", "reference\$(deployment).yaml")
+      if ("$(mode)" -eq "apply") { $cmdArgs += "--apply" }
+      Log "Provision governed tags ($("$(mode)".ToUpper())) from reference\$(deployment).yaml"
+      Write-Host "command        : ucgov-provision $($cmdArgs -join ' ')"
+      ucgov-provision @cmdArgs
+      if ($LASTEXITCODE -ne 0) { Fail "provision governed tags failed (exit $LASTEXITCODE) — see the output above" }
+      Log "Governed tags $(if ("$(mode)" -eq 'apply') { 'provisioned' } else { 'planned' })"
+    displayName: '7. Provision Governed Tags'
+    env:
+      DATABRICKS_HOST: $(adb)
+      DATABRICKS_TOKEN: $(accessToken)
+
+  - powershell: |
+      function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
+      function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
+
+      # same versioned folder scheme as azure-pipelines.yml, but the reference + SQL are deployed:
+      #   .../configs/esg-dev/20261015-48230-a1b2c3d/reference/esg-dev.yaml
+      #                                             /sql/esg-dev/*.sql
       $isPr   = $env:BUILD_REASON -eq "PullRequest"
       $commit = if ($isPr -and $env:SYSTEM_PULLREQUEST_SOURCECOMMITID) { $env:SYSTEM_PULLREQUEST_SOURCECOMMITID } else { "$(Build.SourceVersion)" }
       $date   = (Get-Date).ToUniversalTime().ToString("yyyyMMdd")
       $prNum  = if ($env:SYSTEM_PULLREQUEST_PULLREQUESTNUMBER) { $env:SYSTEM_PULLREQUEST_PULLREQUESTNUMBER } else { $env:SYSTEM_PULLREQUEST_PULLREQUESTID }
       $pr     = if ($isPr) { "pr$prNum-" } else { "" }
-      $target = "$(configRoot)/$(env)/$date-$pr$(Build.BuildId)-$($commit.Substring(0, 7))"
-      Log "Deploy reference"
+      $target = "$(configRoot)/$(deployment)/$date-$pr$(Build.BuildId)-$($commit.Substring(0, 7))"
+      Log "Deploy reference + SQL"
       Write-Host "build reason   : $env:BUILD_REASON$(if ($isPr) { " (PR $prNum)" })"
       Write-Host "commit         : $commit"
       Write-Host "target         : $target"
 
       databricks workspace mkdirs "$target/reference"
       if ($LASTEXITCODE -ne 0) { Fail "could not create $target (exit $LASTEXITCODE)" }
-      databricks workspace import "$target/reference/$(env).yaml" --file "reference\$(env).yaml" --format AUTO --overwrite
+      databricks workspace import "$target/reference/$(deployment).yaml" --file "reference\$(deployment).yaml" --format AUTO --overwrite
       if ($LASTEXITCODE -ne 0) { Fail "reference upload failed (exit $LASTEXITCODE)" }
+      # --format RAW: keep the .sql files as plain workspace files (AUTO could turn them into notebooks)
+      databricks workspace mkdirs "$target/sql/$(deployment)"
+      foreach ($f in Get-ChildItem "sql\$(deployment)\*.sql") {
+        databricks workspace import "$target/sql/$(deployment)/$($f.Name)" --file $f.FullName --format RAW --overwrite
+        if ($LASTEXITCODE -ne 0) { Fail "SQL upload failed for $($f.Name) (exit $LASTEXITCODE)" }
+      }
       Write-Host "##[group]deployed files"
       databricks workspace list "$target/reference"
+      databricks workspace list "$target/sql/$(deployment)"
       Write-Host "##[endgroup]"
 
-      Write-Host "##vso[task.setvariable variable=referencePath]$target/reference/$(env).yaml"
-      Write-Host "reference_path : $target/reference/$(env).yaml"
-      Log "Reference deployed"
-    displayName: '7. Deploy Reference to Workspace'
+      Write-Host "##vso[task.setvariable variable=referencePath]$target/reference/$(deployment).yaml"
+      Write-Host "##vso[task.setvariable variable=sqlPath]$target/sql/$(deployment)"
+      Write-Host "reference_path : $target/reference/$(deployment).yaml"
+      Write-Host "sql_path       : $target/sql/$(deployment)"
+      Log "Reference + SQL deployed"
+    displayName: '8. Deploy Reference + SQL to Workspace'
     env:
       DATABRICKS_HOST: $(adb)
       DATABRICKS_TOKEN: $(accessToken)
 
-  # 8. Apply functions — pull requests always plan; runs on main use the mode parameter.
+  # 9. Apply functions — pull requests always plan; runs on main use the mode parameter.
   - template: templates/run-job.yml
     parameters:
-      displayName: '8a. Apply Functions Plan (pull request)'
+      displayName: '9a. Apply Functions Plan (pull request)'
       condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), in(variables['System.PullRequest.TargetBranch'], 'main', 'refs/heads/main'))
       job: $(functionsJob)
       label: functions
       mode: plan
       jobParameters:
         reference_path: $(referencePath)
+        sql_path: $(sqlPath)
 
   - template: templates/run-job.yml
     parameters:
-      displayName: '8b. Apply Functions ${{ parameters.mode }} (main)'
+      displayName: '9b. Apply Functions ${{ parameters.mode }} (main)'
       condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
       job: $(functionsJob)
       label: functions
       mode: ${{ parameters.mode }}
       jobParameters:
         reference_path: $(referencePath)
+        sql_path: $(sqlPath)

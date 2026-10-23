@@ -1,8 +1,10 @@
-# eastspring-governance-configs — onboarding pipeline.
+# eastspring-governance-configs — config pipeline (reconcile) for one deployment.
+# A deployment is <domain>-<envName> (e.g. esg-dev): excels/<deployment>/ (the workbook),
+# config/<deployment>/ (generated from it), reference/<deployment>.yaml and sql/<deployment>/.
 # Downloads the eastspring-uc-governance wheel built by pipeline 8050, checks that the committed
-# config/esg matches the workbook, validates it against reference/esg.yaml, and — only if that
-# all passed — deploys both to a new, versioned folder in the Databricks workspace and runs a
-# reconcile PLAN (dry run, changes nothing) against it. Runs for pushes to main and for pull
+# config matches its workbook, validates it against the reference + SQL, and — only if that all
+# passed — deploys config + reference to a new, versioned folder in the Databricks workspace and
+# runs a reconcile PLAN (dry run, changes nothing) against it. Runs for pushes to main and for pull
 # requests (build validation), so the delta can be reviewed before merging.
 # Step 7 has two branches: 7a runs for pull requests (always a plan), 7b for main, in the mode
 # chosen by the `mode` run parameter (Run pipeline -> mode: plan | apply). Triggered runs use its
@@ -29,16 +31,18 @@ variables:
   - group: DEV-HERA-REPLATFORM        # adb (workspace URL), accessToken (secret)
   - name: cliVersion
     value: 1.19.0
-  - name: configRoot                  # each deploy goes to <configRoot>/<env>/<yyyyMMdd>-[pr<id>-]<build id>-<short sha>
+  - name: configRoot                  # each deploy goes to <configRoot>/<deployment>/<yyyyMMdd>-[pr<id>-]<build id>-<short sha>
     value: /Workspace/Users/xieming.li@eastspring.com/configs
   - name: wheelPipelineId             # the build pipeline that publishes artifact "wheels"
     value: 8050
   - name: wheelProject
     value: eisgheradp
-  - name: env
+  - name: domain                      # e.g. esg
     value: esg
-  # - name: workbook
-  #   value: excels\esg\access-matrix-esg_workshop-v3-dynamic-views.xlsx
+  - name: envName                     # dev | sit | uat | prod — this pipeline's workspace (variable group above)
+    value: dev
+  - name: deployment                  # excels/, config/, reference/ and sql/ are all per deployment
+    value: $(domain)-$(envName)
   - name: reconcileJob                # created / updated by the wheel pipeline (jobs/ucgov_reconcile.json)
     value: ucgov-reconcile
 
@@ -87,35 +91,26 @@ jobs:
       Write-Host "##vso[task.prependpath]$(System.DefaultWorkingDirectory)\ucgov_venv\Scripts"
     displayName: '2. Install Wheel'
 
-  # - powershell: |
-  #     function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
-  #     function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
+  - powershell: |
+      function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
+      function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
 
-  #     Log "Regenerate config\$(env) from $(workbook)"
-  #     ucgov-generate "$(workbook)" "config\$(env)"
-  #     if ($LASTEXITCODE -ne 0) { Fail "ucgov-generate failed (exit $LASTEXITCODE)" }
-
-  #     Log "Compare with the committed config\$(env)"
-  #     # --ignore-cr-at-eol: files written on Windows have CRLF; only real content changes count
-  #     $changed   = git diff --name-only --ignore-cr-at-eol -- "config/$(env)"
-  #     $untracked = git ls-files --others --exclude-standard -- "config/$(env)"
-  #     if ($changed -or $untracked) {
-  #       Write-Host "##[group]out-of-date files"
-  #       $changed   | ForEach-Object { Write-Host "changed  : $_" }
-  #       $untracked | ForEach-Object { Write-Host "not committed: $_" }
-  #       git --no-pager diff --ignore-cr-at-eol -- "config/$(env)"
-  #       Write-Host "##[endgroup]"
-  #       Fail "config\$(env) is out of date with the workbook — run ucgov-generate locally and commit the result"
-  #     }
-  #     Write-Host "config\$(env) matches the workbook"
-  #   displayName: '3. Check Config Is Up To Date'
+      # the deployment's one workbook (Office lock files ~$*.xlsx don't count)
+      $wb = @(Get-ChildItem "excels\$(deployment)\*.xlsx" | Where-Object { $_.Name -notlike '~$*' })
+      if ($wb.Count -ne 1) { Fail "expected 1 workbook in excels\$(deployment), found $($wb.Count)" }
+      Log "config\$(deployment) is what $($wb[0].Name) generates"
+      # --verify writes nothing: it fails if the committed config differs from what the workbook
+      # generates (line endings don't count), and names the files that differ
+      ucgov-generate $wb[0].FullName "config\$(deployment)" --verify
+      if ($LASTEXITCODE -ne 0) { Fail "config\$(deployment) is out of date with the workbook — run ucgov-generate locally and commit the result" }
+    displayName: '3. Check Config Is Up To Date'
 
   - powershell: |
       function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
       function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
 
-      Log "Validate config\$(env) against reference\$(env).yaml"
-      ucgov-validate "config\$(env)" --reference "reference\$(env).yaml" --verbose
+      Log "Validate config\$(deployment) against reference\$(deployment).yaml + sql\$(deployment)"
+      ucgov-validate "config\$(deployment)" --reference "reference\$(deployment).yaml" --sql "sql\$(deployment)" --verbose
       if ($LASTEXITCODE -ne 0) { Fail "validation failed (exit $LASTEXITCODE) — see the issues above" }
       Log "Config valid"
     displayName: '4. Validate Config'
@@ -140,20 +135,20 @@ jobs:
       Write-Host "version        : $(& "$dir\databricks.exe" version)"
     displayName: '5. Install Databricks CLI $(cliVersion)'
 
-  # Read-only: are the groups + schemas the reference lists provisioned yet? They are created by
-  # azure-pipelines-platform.yml; if one is missing, a reconcile apply would fail on it. A warning
-  # when 7b only plans; an error when this run will apply (mode=apply on main).
+  # Read-only: are the groups, schemas + governed tags the reference lists provisioned yet? They
+  # are created by azure-pipelines-platform.yml; if one is missing, a reconcile apply would fail on
+  # it. A warning when 7b only plans; an error when this run will apply (mode=apply on main).
   - powershell: |
       function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
       function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
       function Warn($m) { Write-Host "##vso[task.logissue type=warning]$m"; Write-Host "##vso[task.complete result=SucceededWithIssues;]" }
       $applying = "${{ parameters.mode }}" -eq "apply" -and $env:BUILD_REASON -ne "PullRequest" -and "$(Build.SourceBranch)" -eq "refs/heads/main"
-      Write-Host "reconcile      : $(if ($applying) { 'APPLY — a missing group / schema is an error' } else { 'plan — a missing group / schema is a warning' })"
+      Write-Host "reconcile      : $(if ($applying) { 'APPLY — a missing group / schema / governed tag is an error' } else { 'plan — a missing group / schema / governed tag is a warning' })"
 
       $missing = @()
-      foreach ($kind in "groups", "schemas") {
+      foreach ($kind in "groups", "schemas", "tags") {
         Log "Provisioned $kind (plan, read-only)"
-        $out = ucgov-provision $kind --reference "reference\$(env).yaml" | Out-String
+        $out = ucgov-provision $kind --reference "reference\$(deployment).yaml" | Out-String
         $rc  = $LASTEXITCODE
         Write-Host $out.TrimEnd()
         if ($rc -ne 0) {
@@ -167,9 +162,9 @@ jobs:
         if ($applying) { Fail $msg }
         Warn $msg
       }
-      else { Log "All groups + schemas exist" }
+      else { Log "All groups, schemas + governed tags exist" }
       exit 0                            # only Fail above fails the step
-    displayName: '5b. Check Groups + Schemas Are Provisioned'
+    displayName: '5b. Check Groups, Schemas + Governed Tags Are Provisioned'
     env:
       DATABRICKS_HOST: $(adb)
       DATABRICKS_TOKEN: $(accessToken)
@@ -178,11 +173,11 @@ jobs:
       function Log($m)  { Write-Host "##[section][$(Get-Date -Format 'HH:mm:ss')] $m" }
       function Fail($m) { Write-Host "##vso[task.logissue type=error]$m"; exit 1 }
 
-      # versioned target: <configRoot>/<env>/<yyyyMMdd>-[pr<id>-]<build id>-<short sha>
-      #   main: .../configs/esg/20261015-48213-a1b2c3d/config/esg/*.yaml
-      #                                                /reference/esg.yaml
-      #   PR  : .../configs/esg/20261015-pr12-48214-e4f5a6b/...
-      # (inside a deploy folder the layout mirrors the repo: config/<env>/ + reference/<env>.yaml)
+      # versioned target: <configRoot>/<deployment>/<yyyyMMdd>-[pr<id>-]<build id>-<short sha>
+      #   main: .../configs/esg-dev/20261015-48213-a1b2c3d/config/esg-dev/*.yaml
+      #                                                    /reference/esg-dev.yaml
+      #   PR  : .../configs/esg-dev/20261015-pr12-48214-e4f5a6b/...
+      # (inside a deploy folder the layout mirrors the repo: config/<deployment>/ + reference/<deployment>.yaml)
       # The name starts with the deploy date (UTC), so old deploys can be found and removed by name,
       # and folders sort oldest -> newest. PR deploys carry "pr<id>" so they can be told apart.
       $isPr   = $env:BUILD_REASON -eq "PullRequest"
@@ -192,32 +187,32 @@ jobs:
       # PR number: GitHub sets PULLREQUESTNUMBER (its PULLREQUESTID is internal); Azure Repos only the id
       $prNum  = if ($env:SYSTEM_PULLREQUEST_PULLREQUESTNUMBER) { $env:SYSTEM_PULLREQUEST_PULLREQUESTNUMBER } else { $env:SYSTEM_PULLREQUEST_PULLREQUESTID }
       $pr     = if ($isPr) { "pr$prNum-" } else { "" }
-      $target = "$(configRoot)/$(env)/$date-$pr$(Build.BuildId)-$($commit.Substring(0, 7))"
+      $target = "$(configRoot)/$(deployment)/$date-$pr$(Build.BuildId)-$($commit.Substring(0, 7))"
       Log "Deploy config"
       Write-Host "workspace      : $env:DATABRICKS_HOST"
       Write-Host "build reason   : $env:BUILD_REASON$(if ($isPr) { " (PR $prNum)" })"
       Write-Host "commit         : $commit"
       Write-Host "target         : $target"
 
-      databricks workspace mkdirs "$target/config/$(env)"
+      databricks workspace mkdirs "$target/config/$(deployment)"
       if ($LASTEXITCODE -ne 0) { Fail "could not create $target (exit $LASTEXITCODE)" }
-      databricks workspace import-dir "config\$(env)" "$target/config/$(env)" --overwrite
+      databricks workspace import-dir "config\$(deployment)" "$target/config/$(deployment)" --overwrite
       if ($LASTEXITCODE -ne 0) { Fail "config upload failed (exit $LASTEXITCODE)" }
 
       databricks workspace mkdirs "$target/reference"
-      databricks workspace import "$target/reference/$(env).yaml" --file "reference\$(env).yaml" --format AUTO --overwrite
+      databricks workspace import "$target/reference/$(deployment).yaml" --file "reference\$(deployment).yaml" --format AUTO --overwrite
       if ($LASTEXITCODE -ne 0) { Fail "reference upload failed (exit $LASTEXITCODE)" }
 
       Write-Host "##[group]deployed files"
-      databricks workspace list "$target/config/$(env)"
+      databricks workspace list "$target/config/$(deployment)"
       databricks workspace list "$target/reference"
       Write-Host "##[endgroup]"
 
       # for later steps (e.g. a reconcile plan): the paths the notebook's widgets need
-      Write-Host "##vso[task.setvariable variable=configPath]$target/config/$(env)"
-      Write-Host "##vso[task.setvariable variable=referencePath]$target/reference/$(env).yaml"
-      Write-Host "config_path    : $target/config/$(env)"
-      Write-Host "reference_path : $target/reference/$(env).yaml"
+      Write-Host "##vso[task.setvariable variable=configPath]$target/config/$(deployment)"
+      Write-Host "##vso[task.setvariable variable=referencePath]$target/reference/$(deployment).yaml"
+      Write-Host "config_path    : $target/config/$(deployment)"
+      Write-Host "reference_path : $target/reference/$(deployment).yaml"
       Log "Config deployed"
     displayName: '6. Deploy Config to Workspace'
     env:

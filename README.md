@@ -31,7 +31,7 @@ change is on its way through.
 
 ## Onboarding a change (business)
 
-Prerequisites: Python 3.13 (3.10+), the wheel from pipeline 8050 (0.3.0 or later); run every
+Prerequisites: Python 3.13 (3.10+), the wheel from pipeline 8050 (0.4.0 or later); run every
 command from the root of this repo. The example is for `esg-dev`; use your deployment's folder.
 
 <table>
@@ -50,22 +50,22 @@ python -m venv .venv
 
 <tr><td><b>Install Wheel</b></td>
 <td><pre>
-pip install /path/to/eastspring_uc_governance-0.3.0-py3-none-any.whl
+pip install /path/to/eastspring_uc_governance-0.4.0-py3-none-any.whl
 </pre></td>
 <td><pre>
-pip install &lt;path-to&gt;\eastspring_uc_governance-0.3.0-py3-none-any.whl
+pip install &lt;path-to&gt;\eastspring_uc_governance-0.4.0-py3-none-any.whl
 </pre></td></tr>
 
 <tr><td><b>Generate yaml from excel</b></td>
 <td><pre>
-ucgov-generate excels/esg-dev/access-matrix-esg_workshop-v3-dynamic-views.xlsx config/esg-dev --check
+ucgov-generate excels/esg-dev/access-matrix-esg_workshop-v3-dynamic-views.xlsx config/esg-dev --reference reference/esg-dev.yaml --check
 
-ucgov-generate excels/esg-dev/access-matrix-esg_workshop-v3-dynamic-views.xlsx config/esg-dev
+ucgov-generate excels/esg-dev/access-matrix-esg_workshop-v3-dynamic-views.xlsx config/esg-dev --reference reference/esg-dev.yaml
 </pre></td>
 <td><pre>
-ucgov-generate excels\esg-dev\access-matrix-esg_workshop-v3-dynamic-views.xlsx config\esg-dev --check
+ucgov-generate excels\esg-dev\access-matrix-esg_workshop-v3-dynamic-views.xlsx config\esg-dev --reference reference\esg-dev.yaml --check
 
-ucgov-generate excels\esg-dev\access-matrix-esg_workshop-v3-dynamic-views.xlsx config\esg-dev
+ucgov-generate excels\esg-dev\access-matrix-esg_workshop-v3-dynamic-views.xlsx config\esg-dev --reference reference\esg-dev.yaml
 </pre></td></tr>
 
 <tr><td><b>Validate</b></td>
@@ -78,10 +78,10 @@ ucgov-validate config\esg-dev --reference reference\esg-dev.yaml --sql sql\esg-d
 
 <tr><td><b>Check before committing</b></td>
 <td><pre>
-ucgov-generate excels/esg-dev/access-matrix-esg_workshop-v3-dynamic-views.xlsx config/esg-dev --verify
+ucgov-generate excels/esg-dev/access-matrix-esg_workshop-v3-dynamic-views.xlsx config/esg-dev --reference reference/esg-dev.yaml --verify
 </pre></td>
 <td><pre>
-ucgov-generate excels\esg-dev\access-matrix-esg_workshop-v3-dynamic-views.xlsx config\esg-dev --verify
+ucgov-generate excels\esg-dev\access-matrix-esg_workshop-v3-dynamic-views.xlsx config\esg-dev --reference reference\esg-dev.yaml --verify
 </pre></td></tr>
 </table>
 
@@ -109,5 +109,5 @@ workspace connection from its variable group (`DEV-HERA-REPLATFORM` for `dev`).
 2. `reference/esg-sit.yaml` — `target_catalog`, the schemas, and the groups with their Entra object
    IDs for SIT; `rls_entitlement_table` under the SIT catalog.
 3. `sql/esg-sit/` — a copy of `sql/esg-dev/` (no edits needed: the catalog comes from the reference).
-4. `ucgov-generate excels/esg-sit/<workbook>.xlsx config/esg-sit`, then validate with `--sql sql/esg-sit`.
+4. `ucgov-generate excels/esg-sit/<workbook>.xlsx config/esg-sit --reference reference/esg-sit.yaml`, then validate with `--sql sql/esg-sit`.
 5. Pipelines for SIT: the same YAML with `envName: sit` and the SIT workspace's variable group.

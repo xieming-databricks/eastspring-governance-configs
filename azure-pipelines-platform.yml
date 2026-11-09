@@ -64,8 +64,8 @@ variables:
     value: 8050
   - name: wheelProject
     value: eisgheradp
-  - name: minWheelVersion             # this repo needs at least this eastspring-uc-governance (e.g. --sql, --verify)
-    value: 0.3.0
+  - name: minWheelVersion             # this repo needs at least this eastspring-uc-governance (generate --reference)
+    value: 0.4.0
   - name: domain                      # e.g. esg
     value: esg
   - name: envName                     # dev | sit | uat | prod — this pipeline's workspace (variable group above)

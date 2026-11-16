@@ -32,7 +32,7 @@ change is on its way through.
 
 ## Onboarding a change (business)
 
-Prerequisites: Python 3.13 (3.10+), the wheel from pipeline 8050 (0.4.0 or later); run every
+Prerequisites: Python 3.13 (3.10+), the wheel from pipeline 8050 (0.5.0 or later); run every
 command from the root of this repo. The example is for `esg-dev`; use your deployment's folder.
 
 <table>
@@ -51,10 +51,10 @@ python -m venv .venv
 
 <tr><td><b>Install Wheel</b></td>
 <td><pre>
-pip install /path/to/eastspring_uc_governance-0.4.0-py3-none-any.whl
+pip install /path/to/eastspring_uc_governance-0.5.0-py3-none-any.whl
 </pre></td>
 <td><pre>
-pip install &lt;path-to&gt;\eastspring_uc_governance-0.4.0-py3-none-any.whl
+pip install &lt;path-to&gt;\eastspring_uc_governance-0.5.0-py3-none-any.whl
 </pre></td></tr>
 
 <tr><td><b>Generate yaml from excel</b></td>

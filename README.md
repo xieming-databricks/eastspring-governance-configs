@@ -14,7 +14,8 @@ A **deployment** is `<domain>-<env>` (e.g. `esg-dev`): one domain (`esg`) in one
 excels/<deployment>/<workbook>.xlsx   the Access Matrix — business-owned, the input
 config/<deployment>/*.yaml            generated from the workbook — never edited by hand
 reference/<deployment>.yaml           the allow-list: target_catalog, schemas, groups (+ Entra
-                                      object IDs), governed tags, protected set — governance-owned
+                                      object IDs, and unmasked: true for the groups that read raw
+                                      PII), governed tags, protected set — governance-owned
 sql/<deployment>/*.sql                mask UDFs + the RLS allow-list MV — governance-owned
 azure-pipelines-platform.yml          provisioning: groups, schemas, governed tags, functions
 azure-pipelines.yml                   reconcile: validate, deploy, plan / apply

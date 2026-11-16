@@ -57,20 +57,21 @@ rls_group_column: ad_group
 # workspace-level IAM v2 proxy API — no account-level access needed). The groups themselves are
 # still account-level (usable in UC grants); an env that shares a group with another env lists it too.
 #
-# name        the group's display name (what grants reference). A name ending in "unmasked" is a
-#             read-UNMASKED group: it is generated into every acm_mask_* UDF's unmasked check, so
-#             its members see raw PII. Name groups deliberately.
+# name        the group's display name (what grants reference). The name has no other meaning.
+# unmasked    optional, true | false (default false). true = a read-UNMASKED group: it is generated
+#             into every acm_mask_* UDF's unmasked check, so its members see raw PII. This flag is
+#             the ONLY thing that unmasks — a group's name never does. Must be a real boolean.
 # external_id the group's Microsoft Entra ID Object ID (GUID) — the authoritative AIM link — and
 #             it picks how the group is provisioned:
 #               set   -> resolved (and provisioned) from Entra ID via AIM (`resolve-group-proxy`)
 #               null  -> created as a local Databricks account group (no Entra link)
 groups:
-  - { name: GSGEIS-hera-all-esg-read-unmasked, external_id: c7855984-0e29-4463-af86-d2103d1299d1 }
+  - { name: GSGEIS-hera-all-esg-read-unmasked, external_id: c7855984-0e29-4463-af86-d2103d1299d1, unmasked: true }
   - { name: GSGEIS-hera-all-esg-read-masked,   external_id: 1f3f024b-61dc-4625-9921-cf3e164f681f }
   - { name: GSGEIS-hera-sg-esg-read-masked,    external_id: c2ae0a3d-ae85-431d-ad59-d1b3e245ad10 }
   - { name: GSGEIS-hera-sg-eq-read-masked,     external_id: 27888b59-c6a9-4cdb-a67f-7391ff654a67 }
   - { name: GSGEIS-hera-sg-fi-read-masked,     external_id: 7af49fb7-690c-4861-be9e-fbd0579d9006 }
-  - { name: GSGEIS-hera-all-admin-admin-unmasked, external_id: e1a017e4-1bd7-485f-945f-96cf63471382 }
+  - { name: GSGEIS-hera-all-admin-admin-unmasked, external_id: e1a017e4-1bd7-485f-945f-96cf63471382, unmasked: true }
 
 # ---- schemas by role (governance + serving created by ucgov-provision schemas; the union is the approved-schema set)
 # governance_schemas: helper schema(s) — mask UDFs, the group_portfolio_access MV, entitlement tables.

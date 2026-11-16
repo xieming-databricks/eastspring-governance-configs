@@ -108,7 +108,7 @@ workspace connection from its variable group (`DEV-HERA-REPLATFORM` for `dev`).
 1. `excels/esg-sit/` — a copy of the dev workbook with the SIT catalog name, **edited in Excel**
    (it has formulas; scripted edits break them).
 2. `reference/esg-sit.yaml` — `target_catalog`, the schemas, and the groups with their Entra object
-   IDs for SIT; `rls_entitlement_table` under the SIT catalog.
+   IDs for SIT; each `rls_entitlements` entry's `rls_table` under the SIT catalog.
 3. `sql/esg-sit/` — a copy of `sql/esg-dev/` (no edits needed: the catalog comes from the reference).
 4. `ucgov-generate excels/esg-sit/<workbook>.xlsx config/esg-sit --reference reference/esg-sit.yaml`, then validate with `--sql sql/esg-sit`.
 5. Pipelines for SIT: the same YAML with `envName: sit` and the SIT workspace's variable group.
